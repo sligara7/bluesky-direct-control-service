@@ -54,17 +54,40 @@ class PVSetRequest(BaseModel):
     """
     Request to set a PV value (Low Fidelity Channel).
 
-    Two modes available:
-    - wait=True (put-completion): Waits for write confirmation.
-    - wait=False (fire-and-forget): Issues write immediately, client monitors
-      PV readback for feedback.
+    Completion modes:
+    - wait=False, use_complete=False (default): fire-and-forget — issue write, return.
+    - wait=True,  use_complete=False: block a CA thread until put finishes.
+    - use_complete=True: put-with-callback — CA thread is freed; service polls
+      for completion via the pyepics put-callback mechanism. Preferred for
+      long puts over HTTP because no worker thread is held.
+
+    `connection_timeout` bounds how long we wait to establish CA connection;
+    separate from `timeout` which bounds the put itself.
+
+    `ftype` forces a non-native DBR type on the wire (rare, e.g. when an IOC
+    expects CHAR waveforms represented differently). Leave None for native.
     """
     model_config = ConfigDict(extra="forbid")
 
     pv_name: str = Field(..., description="EPICS PV name")
     value: Any = Field(..., description="Value to set")
-    wait: bool = Field(False, description="Wait for put completion")
-    timeout: Optional[float] = Field(None, description="Timeout (only used when wait=True)", ge=0.0)
+    wait: bool = Field(False, description="Block the CA thread until put completion")
+    timeout: Optional[float] = Field(
+        None, description="Put timeout in seconds (used with wait=True or use_complete=True)", ge=0.0
+    )
+    connection_timeout: Optional[float] = Field(
+        None, description="Max seconds to wait for CA connection (pyepics default 5s)", ge=0.0
+    )
+    use_complete: bool = Field(
+        False,
+        description=(
+            "If True, wait for put via pyepics put-callback instead of blocking a "
+            "CA thread. Overrides `wait` (always waits) but frees the worker."
+        ),
+    )
+    ftype: Optional[int] = Field(
+        None, description="Force non-native DBR type (power-user knob; leave null for native)"
+    )
 
 
 class PVSetResponse(BaseModel):

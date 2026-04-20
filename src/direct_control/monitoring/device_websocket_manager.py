@@ -8,8 +8,7 @@ Write/stop operations are routed through DeviceControl for coordination checks.
 
 import asyncio
 import uuid
-from datetime import datetime
-from typing import Dict, Optional, Set, TYPE_CHECKING
+from typing import Callable, Dict, Optional, Set, TYPE_CHECKING
 
 import httpx
 import structlog
@@ -24,6 +23,7 @@ from ..models import (
     PVUpdate,
     WebSocketAction,
 )
+from ._envelopes import send_error, send_event
 
 if TYPE_CHECKING:
     from ..protocols import DeviceControl, PVMonitor
@@ -53,7 +53,7 @@ class DeviceWebSocketManager:
         self._connections: Dict[str, WebSocket] = {}
         self._device_subscriptions: Dict[str, Set[str]] = {}
         self._device_pvs: Dict[str, Dict[str, str]] = {}
-        self._pv_callbacks: Dict[str, callable] = {}
+        self._pv_callbacks: Dict[str, Callable[[PVUpdate], None]] = {}
         self._device_clients: Dict[str, Set[str]] = {}
         self._lock = asyncio.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -63,6 +63,21 @@ class DeviceWebSocketManager:
         if self._http_client is None:
             self._http_client = httpx.AsyncClient(timeout=10.0)
         return self._http_client
+
+    async def cleanup(self) -> None:
+        """Close the pooled HTTP client and open WebSocket connections."""
+        if self._http_client is not None:
+            await self._http_client.aclose()
+            self._http_client = None
+
+        async with self._lock:
+            sockets = list(self._connections.values())
+            self._connections.clear()
+        for ws in sockets:
+            try:
+                await ws.close(code=1001, reason="Service shutting down")
+            except Exception:  # noqa: BLE001
+                pass
 
     async def _fetch_device_info(self, device_name: str) -> Optional[DeviceInfo]:
         config_url = self.settings.configuration_service_url
@@ -85,7 +100,7 @@ class DeviceWebSocketManager:
                 status=response.status_code,
             )
             return None
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.error("device_info_fetch_error", device_name=device_name, error=str(e))
             return None
 
@@ -107,22 +122,21 @@ class DeviceWebSocketManager:
         async with self._lock:
             self._connections.pop(client_id, None)
             device_names = self._device_subscriptions.pop(client_id, set())
-
+            releases = []
             for device_name in device_names:
                 if device_name in self._device_clients:
                     self._device_clients[device_name].discard(client_id)
                     if not self._device_clients[device_name]:
                         self._device_clients.pop(device_name)
-                        await self._unsubscribe_device_pvs(device_name)
+                        releases.append(self._device_pvs.pop(device_name, {}))
+
+        for pvs in releases:
+            for pv_name in pvs.values():
+                callback = self._pv_callbacks.pop(pv_name, None)
+                if callback:
+                    self.pv_monitor.unsubscribe(pv_name, callback)
 
         logger.info("device_websocket_disconnected", client_id=client_id)
-
-    async def _unsubscribe_device_pvs(self, device_name: str):
-        pvs = self._device_pvs.pop(device_name, {})
-        for pv_name in pvs.values():
-            callback = self._pv_callbacks.pop(pv_name, None)
-            if callback:
-                self.pv_monitor.unsubscribe(pv_name, callback)
 
     async def subscribe_device(
         self, client_id: str, device_name: str, require_connection: bool = False
@@ -138,6 +152,7 @@ class DeviceWebSocketManager:
         if device_info is None:
             return False
 
+        new_subscriptions: list[tuple[str, str, Callable[[PVUpdate], None]]] = []
         async with self._lock:
             self._device_subscriptions[client_id].add(device_name)
 
@@ -146,24 +161,34 @@ class DeviceWebSocketManager:
                 self._device_pvs[device_name] = device_info.pvs
 
                 for component, pv_name in device_info.pvs.items():
-                    callback = self._make_device_callback(device_name, component, pv_name)
+                    callback = self._make_device_callback(device_name, component)
                     self._pv_callbacks[pv_name] = callback
-                    try:
-                        self.pv_monitor.subscribe(pv_name, callback)
-                        logger.debug(
-                            "subscribed_device_pv",
-                            device=device_name,
-                            component=component,
-                            pv=pv_name,
-                        )
-                    except Exception as e:
-                        logger.error(
-                            "device_pv_subscribe_failed", pv=pv_name, error=str(e)
-                        )
-                        if require_connection:
-                            return False
+                    new_subscriptions.append((component, pv_name, callback))
 
             self._device_clients[device_name].add(client_id)
+
+        # Run blocking EPICS subscribes concurrently, outside the asyncio lock.
+        results = await asyncio.gather(
+            *(
+                asyncio.to_thread(self.pv_monitor.subscribe, pv_name, callback)
+                for _, pv_name, callback in new_subscriptions
+            ),
+            return_exceptions=True,
+        )
+        for (component, pv_name, _), result in zip(new_subscriptions, results):
+            if isinstance(result, Exception):
+                logger.error(
+                    "device_pv_subscribe_failed", pv=pv_name, error=str(result)
+                )
+                if require_connection:
+                    return False
+            else:
+                logger.debug(
+                    "subscribed_device_pv",
+                    device=device_name,
+                    component=component,
+                    pv=pv_name,
+                )
 
         await self._send_current_values(client_id, device_name)
 
@@ -176,6 +201,7 @@ class DeviceWebSocketManager:
         return True
 
     async def unsubscribe_device(self, client_id: str, device_name: str):
+        released_pvs: Dict[str, str] = {}
         async with self._lock:
             if client_id not in self._device_subscriptions:
                 return
@@ -186,12 +212,19 @@ class DeviceWebSocketManager:
                 self._device_clients[device_name].discard(client_id)
                 if not self._device_clients[device_name]:
                     self._device_clients.pop(device_name)
-                    await self._unsubscribe_device_pvs(device_name)
+                    released_pvs = self._device_pvs.pop(device_name, {})
+
+        for pv_name in released_pvs.values():
+            callback = self._pv_callbacks.pop(pv_name, None)
+            if callback:
+                self.pv_monitor.unsubscribe(pv_name, callback)
 
         logger.info("device_unsubscribed", client_id=client_id, device=device_name)
 
-    def _make_device_callback(self, device_name: str, component: str, pv_name: str):
-        def callback(update: PVUpdate):
+    def _make_device_callback(
+        self, device_name: str, component: str
+    ) -> Callable[[PVUpdate], None]:
+        def callback(update: PVUpdate) -> None:
             if self._loop is None:
                 return
             device_update = DeviceUpdate(
@@ -212,7 +245,6 @@ class DeviceWebSocketManager:
     async def _broadcast_device_update(self, device_name: str, update: DeviceUpdate):
         async with self._lock:
             client_ids = self._device_clients.get(device_name, set()).copy()
-
         for client_id in client_ids:
             await self._send_to_client(client_id, update)
 
@@ -225,33 +257,38 @@ class DeviceWebSocketManager:
 
         try:
             await websocket.send_json(update.model_dump(mode="json"))
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.error("device_websocket_send_error", client_id=client_id, error=str(e))
 
     async def _send_current_values(self, client_id: str, device_name: str):
         async with self._lock:
-            pvs = self._device_pvs.get(device_name, {})
+            pvs = dict(self._device_pvs.get(device_name, {}))
             websocket = self._connections.get(client_id)
 
-        if not websocket:
+        if not websocket or not pvs:
             return
 
-        for component, pv_name in pvs.items():
-            current_value = await asyncio.to_thread(self.pv_monitor.get_value, pv_name)
-            if current_value:
-                update = DeviceUpdate(
-                    device=device_name,
-                    signal=component,
-                    value=current_value.value,
-                    timestamp=current_value.timestamp,
-                    connected=current_value.connected,
-                    read_access=True,
-                    write_access=True,
-                )
-                try:
-                    await websocket.send_json(update.model_dump(mode="json"))
-                except Exception as e:
-                    logger.error("send_current_value_error", error=str(e))
+        components = list(pvs.items())
+        values = await asyncio.gather(
+            *(asyncio.to_thread(self.pv_monitor.get_value, pv_name) for _, pv_name in components),
+            return_exceptions=True,
+        )
+        for (component, _), value in zip(components, values):
+            if isinstance(value, BaseException) or value is None:
+                continue
+            update = DeviceUpdate(
+                device=device_name,
+                signal=component,
+                value=value.value,
+                timestamp=value.timestamp,
+                connected=value.connected,
+                read_access=True,
+                write_access=True,
+            )
+            try:
+                await websocket.send_json(update.model_dump(mode="json"))
+            except Exception as e:  # noqa: BLE001
+                logger.error("send_current_value_error", error=str(e))
 
     async def handle_client(self, websocket: WebSocket):
         client_id = await self.connect(websocket)
@@ -276,143 +313,91 @@ class DeviceWebSocketManager:
                 elif action in ("stop", WebSocketAction.STOP.value):
                     await self._handle_stop(client_id, websocket, data)
                 elif action == "ping":
-                    await websocket.send_json(
-                        {"type": "pong", "timestamp": datetime.now().isoformat()}
-                    )
+                    await send_event(websocket, "pong")
                 else:
-                    await websocket.send_json(
-                        {
-                            "type": "error",
-                            "message": (
-                                f"Unknown action: {action}. Expected: subscribe, "
-                                "unsubscribe, subscribeSafely, subscribeReadOnly, "
-                                "refresh, set, stop, ping"
-                            ),
-                            "timestamp": datetime.now().isoformat(),
-                        }
+                    await send_error(
+                        websocket,
+                        (
+                            f"Unknown action: {action}. Expected: subscribe, "
+                            "unsubscribe, subscribeSafely, subscribeReadOnly, "
+                            "refresh, set, stop, ping"
+                        ),
                     )
 
         except WebSocketDisconnect:
             logger.info("device_websocket_disconnect", client_id=client_id)
-        except Exception as e:
-            logger.error("device_websocket_error", client_id=client_id, error=str(e))
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                "device_websocket_error", client_id=client_id, error=str(e), exc_info=True
+            )
         finally:
             await self.disconnect(client_id)
 
     async def _handle_subscribe(self, client_id: str, websocket: WebSocket, data: dict):
         device_name = data.get("device")
         if not device_name:
-            await websocket.send_json(
-                {
-                    "type": "error",
-                    "message": "device field required",
-                    "timestamp": datetime.now().isoformat(),
-                }
-            )
+            await send_error(websocket, "device field required")
             return
 
         if await self.subscribe_device(client_id, device_name):
-            await websocket.send_json(
-                {
-                    "type": "subscribed",
-                    "device": device_name,
-                    "message": f"Subscribed to device {device_name}",
-                    "timestamp": datetime.now().isoformat(),
-                }
+            await send_event(
+                websocket,
+                "subscribed",
+                device=device_name,
+                message=f"Subscribed to device {device_name}",
             )
         else:
-            await websocket.send_json(
-                {
-                    "type": "error",
-                    "message": f"Device '{device_name}' not found in configuration service",
-                    "device": device_name,
-                    "timestamp": datetime.now().isoformat(),
-                }
+            await send_error(
+                websocket,
+                f"Device '{device_name}' not found in configuration service",
+                device=device_name,
             )
 
     async def _handle_unsubscribe(self, client_id: str, websocket: WebSocket, data: dict):
         device_name = data.get("device")
         if not device_name:
-            await websocket.send_json(
-                {
-                    "type": "error",
-                    "message": "device field required",
-                    "timestamp": datetime.now().isoformat(),
-                }
-            )
+            await send_error(websocket, "device field required")
             return
 
         await self.unsubscribe_device(client_id, device_name)
-        await websocket.send_json(
-            {
-                "type": "unsubscribed",
-                "device": device_name,
-                "message": f"Unsubscribed from {device_name}",
-                "timestamp": datetime.now().isoformat(),
-            }
+        await send_event(
+            websocket,
+            "unsubscribed",
+            device=device_name,
+            message=f"Unsubscribed from {device_name}",
         )
 
     async def _handle_subscribe_safely(self, client_id: str, websocket: WebSocket, data: dict):
         device_name = data.get("device")
         if not device_name:
-            await websocket.send_json(
-                {
-                    "type": "error",
-                    "message": "device field required",
-                    "timestamp": datetime.now().isoformat(),
-                }
-            )
+            await send_error(websocket, "device field required")
             return
 
         if await self.subscribe_device(client_id, device_name, require_connection=True):
-            await websocket.send_json(
-                {
-                    "type": "subscribed",
-                    "device": device_name,
-                    "connected": True,
-                    "timestamp": datetime.now().isoformat(),
-                }
+            await send_event(
+                websocket, "subscribed", device=device_name, connected=True
             )
         else:
-            await websocket.send_json(
-                {
-                    "type": "error",
-                    "message": f"Device {device_name} not connected or not found",
-                    "device": device_name,
-                    "connected": False,
-                    "timestamp": datetime.now().isoformat(),
-                }
+            await send_error(
+                websocket,
+                f"Device {device_name} not connected or not found",
+                device=device_name,
+                connected=False,
             )
 
     async def _handle_subscribe_read_only(self, client_id: str, websocket: WebSocket, data: dict):
         device_name = data.get("device")
         if not device_name:
-            await websocket.send_json(
-                {
-                    "type": "error",
-                    "message": "device field required",
-                    "timestamp": datetime.now().isoformat(),
-                }
-            )
+            await send_error(websocket, "device field required")
             return
 
         if await self.subscribe_device(client_id, device_name):
-            await websocket.send_json(
-                {
-                    "type": "subscribed",
-                    "device": device_name,
-                    "read_only": True,
-                    "timestamp": datetime.now().isoformat(),
-                }
+            await send_event(
+                websocket, "subscribed", device=device_name, read_only=True
             )
         else:
-            await websocket.send_json(
-                {
-                    "type": "error",
-                    "message": f"Device {device_name} not found",
-                    "device": device_name,
-                    "timestamp": datetime.now().isoformat(),
-                }
+            await send_error(
+                websocket, f"Device {device_name} not found", device=device_name
             )
 
     async def _handle_refresh(self, client_id: str, websocket: WebSocket, data: dict):
@@ -428,16 +413,8 @@ class DeviceWebSocketManager:
             else:
                 devices = list(self._device_subscriptions.get(client_id, set()))
 
-        for dev in devices:
-            await self._send_current_values(client_id, dev)
-
-        await websocket.send_json(
-            {
-                "type": "refreshed",
-                "devices": devices,
-                "timestamp": datetime.now().isoformat(),
-            }
-        )
+        await asyncio.gather(*(self._send_current_values(client_id, d) for d in devices))
+        await send_event(websocket, "refreshed", devices=devices)
 
     async def _handle_set(self, client_id: str, websocket: WebSocket, data: dict):
         """Set device component via DeviceControl (inherits coordination check)."""
@@ -448,26 +425,15 @@ class DeviceWebSocketManager:
         use_put = bool(data.get("use_put", False))
 
         if not device_name or value is None:
-            await websocket.send_json(
-                {
-                    "type": "error",
-                    "message": "device and value fields required",
-                    "timestamp": datetime.now().isoformat(),
-                }
-            )
+            await send_error(websocket, "device and value fields required")
             return
 
         async with self._lock:
             if device_name not in self._device_subscriptions.get(client_id, set()):
-                await websocket.send_json(
-                    {
-                        "type": "error",
-                        "message": (
-                            f"Device {device_name} not subscribed. Subscribe before setting."
-                        ),
-                        "device": device_name,
-                        "timestamp": datetime.now().isoformat(),
-                    }
+                await send_error(
+                    websocket,
+                    f"Device {device_name} not subscribed. Subscribe before setting.",
+                    device=device_name,
                 )
                 return
 
@@ -475,69 +441,38 @@ class DeviceWebSocketManager:
             device_path = f"{device_name}.{component}" if component else device_name
             method = "put" if use_put else "set"
             result = await self.device_controller.access_nested_device(
-                device_path=device_path,
-                method=method,
-                value=value,
-                timeout=timeout,
+                device_path=device_path, method=method, value=value, timeout=timeout
             )
-            await websocket.send_json(
-                {
-                    "type": "set_complete",
-                    "device": device_name,
-                    "component": component,
-                    "value": value,
-                    "success": True,
-                    "result": result,
-                    "use_put": use_put,
-                    "timestamp": datetime.now().isoformat(),
-                }
+            await send_event(
+                websocket,
+                "set_complete",
+                device=device_name,
+                component=component,
+                value=value,
+                success=True,
+                result=result,
+                use_put=use_put,
             )
         except DeviceLockedError as e:
-            await websocket.send_json(
-                {
-                    "type": "error",
-                    "message": str(e),
-                    "device": device_name,
-                    "locked": True,
-                    "timestamp": datetime.now().isoformat(),
-                }
-            )
-        except Exception as e:
+            await send_error(websocket, str(e), device=device_name, locked=True)
+        except Exception as e:  # noqa: BLE001
             logger.error("device_set_error", device=device_name, value=value, error=str(e))
-            await websocket.send_json(
-                {
-                    "type": "error",
-                    "message": str(e),
-                    "device": device_name,
-                    "timestamp": datetime.now().isoformat(),
-                }
-            )
+            await send_error(websocket, str(e), device=device_name)
 
     async def _handle_stop(self, client_id: str, websocket: WebSocket, data: dict):
         """Stop a device via DeviceControl (inherits coordination check)."""
         device_name = data.get("device")
 
         if not device_name:
-            await websocket.send_json(
-                {
-                    "type": "error",
-                    "message": "device field required for stop",
-                    "timestamp": datetime.now().isoformat(),
-                }
-            )
+            await send_error(websocket, "device field required for stop")
             return
 
         async with self._lock:
             if device_name not in self._device_subscriptions.get(client_id, set()):
-                await websocket.send_json(
-                    {
-                        "type": "error",
-                        "message": (
-                            f"Device {device_name} not subscribed. Subscribe before stopping."
-                        ),
-                        "device": device_name,
-                        "timestamp": datetime.now().isoformat(),
-                    }
+                await send_error(
+                    websocket,
+                    f"Device {device_name} not subscribed. Subscribe before stopping.",
+                    device=device_name,
                 )
                 return
 
@@ -547,35 +482,18 @@ class DeviceWebSocketManager:
                     device_name=device_name, method="stop", args=[], kwargs={}
                 )
             )
-            await websocket.send_json(
-                {
-                    "type": "stop_complete",
-                    "device": device_name,
-                    "success": response.success,
-                    "message": response.message or "Device stopped",
-                    "timestamp": datetime.now().isoformat(),
-                }
+            await send_event(
+                websocket,
+                "stop_complete",
+                device=device_name,
+                success=response.success,
+                message=response.message or "Device stopped",
             )
         except DeviceLockedError as e:
-            await websocket.send_json(
-                {
-                    "type": "error",
-                    "message": str(e),
-                    "device": device_name,
-                    "locked": True,
-                    "timestamp": datetime.now().isoformat(),
-                }
-            )
-        except Exception as e:
+            await send_error(websocket, str(e), device=device_name, locked=True)
+        except Exception as e:  # noqa: BLE001
             logger.error("device_stop_error", device=device_name, error=str(e))
-            await websocket.send_json(
-                {
-                    "type": "error",
-                    "message": str(e),
-                    "device": device_name,
-                    "timestamp": datetime.now().isoformat(),
-                }
-            )
+            await send_error(websocket, str(e), device=device_name)
 
     def get_stats(self) -> dict:
         return {

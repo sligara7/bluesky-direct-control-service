@@ -100,8 +100,37 @@ bluesky-direct-control --help
 ### PV Control (Low Fidelity, coordination-checked)
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/api/v1/pv/set` | Set PV value |
-| GET | `/api/v1/pv/{pv_name}/value` | One-shot CA get (read-only) |
+| POST | `/api/v1/pv/set` | Set PV value (pyepics caput knobs) |
+| GET | `/api/v1/pv/{pv_name}/value` | One-shot CA get (pyepics caget knobs as query params) |
+
+**`POST /api/v1/pv/set` body fields** (pyepics `caput` knobs):
+
+| Field | Type | Default | pyepics mapping |
+|---|---|---|---|
+| `pv_name` | string (required) | — | `caput(pvname=…)` |
+| `value` | any (required) | — | `caput(value=…)` |
+| `wait` | bool | `false` | `caput(wait=…)` — block CA thread until done |
+| `timeout` | float \| null | `command_timeout` (30s) | `caput(timeout=…)` |
+| `connection_timeout` | float \| null | pyepics default (5s) | `caput(connection_timeout=…)` |
+| `use_complete` | bool | `false` | Routes to `PV.put(use_complete=True)`; service awaits put-callback without holding a CA thread. Overrides `wait`. |
+| `ftype` | int \| null | native | Forces non-native DBR type via `ca.put(ftype=…)` (power-user) |
+
+Completion modes:
+- `wait=false, use_complete=false` — fire-and-forget.
+- `wait=true, use_complete=false` — blocking wait (ties up a CA thread for up to `timeout`).
+- `use_complete=true` — put-with-callback; preferred for long puts over HTTP since no worker thread is held.
+
+**`GET /api/v1/pv/{pv_name}/value` query params** (pyepics `caget` knobs):
+
+| Param | Type | Default | Meaning |
+|---|---|---|---|
+| `as_string` | bool | `false` | Return string representation (enum labels, char-waveform decoded) |
+| `count` | int \| null | native | Cap waveform elements returned |
+| `as_numpy` | bool | `true` | Return arrays as numpy (JSON-serialized to list either way) |
+| `use_monitor` | bool | `true` | Use monitor cache; `false` forces fresh CA get |
+| `timeout` | float | `5.0` | CA get timeout (seconds) |
+| `connection_timeout` | float | `5.0` | CA connection timeout (seconds) |
+| `ftype` | int \| null | native | Force non-native DBR type via `ca.get(ftype=…)` (power-user) |
 
 ### PV Monitoring (subscription-backed)
 | Method | Endpoint | Description |
@@ -153,11 +182,27 @@ curl -X POST http://localhost:8003/api/v1/pv/set \
   -d '{"pv_name": "IOC:motor1", "value": 10.0, "wait": false}'
 ```
 
-### Set PV Value (Put-Completion)
+### Set PV Value (Put-Completion, blocking)
 ```bash
 curl -X POST http://localhost:8003/api/v1/pv/set \
   -H "Content-Type: application/json" \
   -d '{"pv_name": "IOC:motor1", "value": 10.0, "wait": true, "timeout": 5.0}'
+```
+
+### Set PV Value (Put-with-Callback — no CA thread held)
+```bash
+curl -X POST http://localhost:8003/api/v1/pv/set \
+  -H "Content-Type: application/json" \
+  -d '{"pv_name": "IOC:motor1", "value": 10.0, "use_complete": true, "timeout": 30.0}'
+```
+
+### One-shot Get with Knobs
+```bash
+# Enum label instead of index, bounded connection timeout
+curl "http://localhost:8003/api/v1/pv/IOC:valve1.VAL/value?as_string=true&connection_timeout=2.0"
+
+# Fresh CA get (bypass monitor cache), waveform truncated to first 100 samples
+curl "http://localhost:8003/api/v1/pv/IOC:wf1/value?use_monitor=false&count=100"
 ```
 
 ### Get PV Value (subscription-backed, with metadata)

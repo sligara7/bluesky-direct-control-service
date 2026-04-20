@@ -8,7 +8,7 @@ coordination checks (A4 requirement).
 import asyncio
 from typing import Any, Optional, Dict, TYPE_CHECKING
 import structlog
-from epics import caget, caput, PV
+from epics import ca, caget, caput, get_pv, PV
 from datetime import datetime
 
 from .models import (
@@ -106,18 +106,17 @@ class DeviceController:
                 wait=request.wait,
             )
 
-            # Run caput in thread pool to avoid blocking
-            loop = asyncio.get_event_loop()
             timeout = request.timeout or self.settings.command_timeout
+            connection_timeout = request.connection_timeout or 5.0
 
-            success = await loop.run_in_executor(
-                None,
-                lambda: caput(
-                    pv_name,
-                    request.value,
-                    wait=request.wait,
-                    timeout=timeout,
-                )
+            success = await self._execute_put(
+                pv_name=pv_name,
+                value=request.value,
+                wait=request.wait,
+                timeout=timeout,
+                connection_timeout=connection_timeout,
+                use_complete=request.use_complete,
+                ftype=request.ftype,
             )
 
             if success:
@@ -269,23 +268,131 @@ class DeviceController:
                 use_put=request.use_put,
             )
     
-    async def get_pv_value(self, pv_name: str) -> Optional[Any]:
+    async def _execute_put(
+        self,
+        *,
+        pv_name: str,
+        value: Any,
+        wait: bool,
+        timeout: float,
+        connection_timeout: float,
+        use_complete: bool,
+        ftype: Optional[int],
+    ) -> bool:
+        """
+        Execute a PV put, routing through the right pyepics entrypoint.
+
+        - No `use_complete` and no `ftype`: use the high-level `caput()`.
+        - `use_complete`: use the pyepics put-callback mechanism; the CA thread
+          is freed and we await completion via an `asyncio.Event`.
+        - `ftype`: drop to `ca.put(chid, ..., ftype=...)` which is the only
+          pyepics entrypoint that accepts a forced field type.
+        """
+        loop = asyncio.get_event_loop()
+
+        if not use_complete and ftype is None:
+            status = await loop.run_in_executor(
+                None,
+                lambda: caput(
+                    pv_name,
+                    value,
+                    wait=wait,
+                    timeout=timeout,
+                    connection_timeout=connection_timeout,
+                ),
+            )
+            return bool(status and status > 0)
+
+        pv = await loop.run_in_executor(
+            None,
+            lambda: get_pv(pv_name, timeout=connection_timeout, connect=True),
+        )
+        if not pv.connected:
+            logger.warning("pv_connect_failed", pv_name=pv_name)
+            return False
+
+        if use_complete:
+            done = asyncio.Event()
+
+            def _cb(**_kw: Any) -> None:
+                loop.call_soon_threadsafe(done.set)
+
+            if ftype is not None:
+                await loop.run_in_executor(
+                    None,
+                    lambda: ca.put(pv.chid, value, wait=False, callback=_cb, ftype=ftype),
+                )
+            else:
+                await loop.run_in_executor(
+                    None,
+                    lambda: pv.put(value, use_complete=True, callback=_cb),
+                )
+            try:
+                await asyncio.wait_for(done.wait(), timeout=timeout)
+                return True
+            except asyncio.TimeoutError:
+                logger.warning("put_callback_timeout", pv_name=pv_name, timeout=timeout)
+                return False
+
+        # ftype without use_complete
+        status = await loop.run_in_executor(
+            None,
+            lambda: ca.put(pv.chid, value, wait=wait, timeout=timeout, ftype=ftype),
+        )
+        return status == 1
+
+    async def get_pv_value(
+        self,
+        pv_name: str,
+        *,
+        as_string: bool = False,
+        count: Optional[int] = None,
+        as_numpy: bool = True,
+        use_monitor: bool = True,
+        timeout: float = 5.0,
+        connection_timeout: float = 5.0,
+        ftype: Optional[int] = None,
+    ) -> Optional[Any]:
         """
         Get current PV value (read-only, no coordination check needed).
 
-        Args:
-            pv_name: EPICS PV name
-
-        Returns:
-            Current PV value or None if not available
+        Exposes pyepics caget/ca.get knobs so clients can trade off freshness,
+        representation, and transport. `ftype=None` uses the native DBR type;
+        setting `ftype` forces a non-native type on the wire (rare).
         """
+        loop = asyncio.get_event_loop()
         try:
-            loop = asyncio.get_event_loop()
-            value = await loop.run_in_executor(
+            if ftype is None:
+                return await loop.run_in_executor(
+                    None,
+                    lambda: caget(
+                        pv_name,
+                        as_string=as_string,
+                        count=count,
+                        as_numpy=as_numpy,
+                        use_monitor=use_monitor,
+                        timeout=timeout,
+                        connection_timeout=connection_timeout,
+                    ),
+                )
+
+            pv = await loop.run_in_executor(
                 None,
-                lambda: caget(pv_name, timeout=5.0)
+                lambda: get_pv(pv_name, timeout=connection_timeout, connect=True),
             )
-            return value
+            if not pv.connected:
+                return None
+            return await loop.run_in_executor(
+                None,
+                lambda: ca.get(
+                    pv.chid,
+                    ftype=ftype,
+                    count=count,
+                    timeout=timeout,
+                    as_string=as_string,
+                    as_numpy=as_numpy,
+                ),
+            )
         except Exception as e:
             logger.error("get_pv_error", pv_name=pv_name, error=str(e))
             return None

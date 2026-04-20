@@ -123,15 +123,22 @@ class DeviceControl(Protocol):
         """
         ...
 
-    async def get_pv_value(self, pv_name: str) -> Optional[Any]:
+    async def get_pv_value(
+        self,
+        pv_name: str,
+        *,
+        as_string: bool = False,
+        count: Optional[int] = None,
+        as_numpy: bool = True,
+        use_monitor: bool = True,
+        timeout: float = 5.0,
+        connection_timeout: float = 5.0,
+        ftype: Optional[int] = None,
+    ) -> Optional[Any]:
         """
         Get current PV value (read-only, no coordination check).
 
-        Args:
-            pv_name: EPICS PV name
-
-        Returns:
-            Current PV value or None if not available
+        Exposes pyepics caget/ca.get knobs; defaults preserve legacy behavior.
         """
         ...
 

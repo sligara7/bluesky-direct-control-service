@@ -9,10 +9,12 @@ Uses lifespan pattern to defer Settings() creation until after CLI sets
 environment variables (pyepics reads EPICS_CA_* env vars at import time).
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+import httpx
 import structlog
 from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
@@ -39,8 +41,6 @@ from .registry_client import RegistryClient, RegistryValidationError
 logger = structlog.get_logger(__name__)
 
 
-# ===== Application Lifecycle =====
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize clients and managers on startup, clean up on shutdown."""
@@ -48,7 +48,7 @@ async def lifespan(app: FastAPI):
 
     settings = Settings()
 
-    # Import pyepics-dependent managers after env vars are in place
+    # Import pyepics-dependent managers after env vars are in place.
     from .monitoring.device_websocket_manager import DeviceWebSocketManager
     from .monitoring.pv_monitor import PVMonitorManager
     from .monitoring.websocket_manager import WebSocketManager
@@ -56,6 +56,9 @@ async def lifespan(app: FastAPI):
     coordination_client = CoordinationClient(settings)
     device_controller = DeviceController(settings, coordination_client)
     registry_client = RegistryClient(settings)
+    config_http = httpx.AsyncClient(
+        base_url=settings.configuration_service_url, timeout=10.0
+    )
     pv_monitor = PVMonitorManager(settings)
     ws_manager = WebSocketManager(
         pv_monitor=pv_monitor,
@@ -72,6 +75,7 @@ async def lifespan(app: FastAPI):
     app.state.coordination_client = coordination_client
     app.state.device_controller = device_controller
     app.state.registry_client = registry_client
+    app.state.config_http = config_http
     app.state.pv_monitor = pv_monitor
     app.state.ws_manager = ws_manager
     app.state.device_ws_manager = device_ws_manager
@@ -87,8 +91,11 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         logger.info("Shutting down service")
+        await ws_manager.close_all()
+        await device_ws_manager.cleanup()
         await coordination_client.cleanup()
         await registry_client.cleanup()
+        await config_http.aclose()
         await pv_monitor.cleanup()
         logger.info("Service shut down")
 
@@ -114,8 +121,6 @@ app.add_middleware(
 )
 
 
-# ===== Dependency Injection =====
-
 def get_settings() -> Settings:
     return app.state.settings
 
@@ -136,6 +141,10 @@ def get_pv_monitor() -> PVMonitor:
     return app.state.pv_monitor
 
 
+def get_config_http() -> httpx.AsyncClient:
+    return app.state.config_http
+
+
 def get_ws_manager():
     return app.state.ws_manager
 
@@ -143,8 +152,6 @@ def get_ws_manager():
 def get_device_ws_manager():
     return app.state.device_ws_manager
 
-
-# ===== Health & Stats =====
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check(
@@ -198,8 +205,6 @@ async def get_stats(
     }
 
 
-# ===== PV Control Endpoints =====
-
 @app.post("/api/v1/pv/set", response_model=PVSetResponse)
 async def set_pv(
     request: PVSetRequest,
@@ -239,10 +244,22 @@ async def set_pv(
 @app.get("/api/v1/pv/{pv_name}/value")
 async def get_pv_value_from_controller(
     pv_name: str,
+    as_string: bool = Query(False, description="Return the string representation (e.g. enum label)"),
+    count: Optional[int] = Query(None, ge=1, description="Max waveform elements to return"),
+    as_numpy: bool = Query(True, description="Return arrays as numpy.ndarray (JSON-serialized to list)"),
+    use_monitor: bool = Query(True, description="Use cached monitor value (false = force fresh CA get)"),
+    timeout: float = Query(5.0, gt=0, description="CA get timeout in seconds"),
+    connection_timeout: float = Query(5.0, gt=0, description="CA connection timeout in seconds"),
+    ftype: Optional[int] = Query(None, description="Force non-native DBR type (power user)"),
     device_controller: DeviceControl = Depends(get_device_controller),
     registry_client: RegistryClient = Depends(get_registry_client),
 ):
-    """One-shot CA get via DeviceController (no subscription)."""
+    """
+    One-shot CA get via DeviceController (no subscription).
+
+    Exposes the pyepics caget / ca.get knobs as query params; defaults
+    preserve the previous behavior.
+    """
     try:
         await registry_client.validate_pv(pv_name)
     except RegistryValidationError as e:
@@ -250,7 +267,16 @@ async def get_pv_value_from_controller(
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
-    value = await device_controller.get_pv_value(pv_name)
+    value = await device_controller.get_pv_value(
+        pv_name,
+        as_string=as_string,
+        count=count,
+        as_numpy=as_numpy,
+        use_monitor=use_monitor,
+        timeout=timeout,
+        connection_timeout=connection_timeout,
+        ftype=ftype,
+    )
     if value is None:
         raise HTTPException(status_code=404, detail=f"PV {pv_name} not found or not available")
 
@@ -260,8 +286,6 @@ async def get_pv_value_from_controller(
         "timestamp": datetime.now().isoformat(),
     }
 
-
-# ===== Monitored PV Endpoints (subscription-backed) =====
 
 @app.get("/api/v1/pvs/{pv_name}/value", response_model=PVValue)
 async def get_monitored_pv_value(
@@ -283,10 +307,11 @@ async def get_monitored_pv_value(
         raise HTTPException(status_code=503, detail=str(e))
 
     try:
-        if not pv_monitor.is_connected(pv_name):
-            pv_monitor.subscribe(pv_name)
+        # subscribe is idempotent in PVMonitorManager; calling it unconditionally
+        # avoids a TOCTOU gap and reads block briefly on EPICS, so run off-loop.
+        await asyncio.to_thread(pv_monitor.subscribe, pv_name)
 
-        value = pv_monitor.get_value(pv_name)
+        value = await asyncio.to_thread(pv_monitor.get_value, pv_name)
         if not value:
             raise HTTPException(status_code=404, detail=f"PV {pv_name} not found")
         return value
@@ -305,8 +330,6 @@ async def get_connected_pvs(pv_monitor: PVMonitor = Depends(get_pv_monitor)):
     """List PVs currently connected in the monitoring subsystem."""
     return pv_monitor.get_connected_pvs()
 
-
-# ===== Device Control Endpoints =====
 
 @app.post("/api/v1/device/execute", response_model=DeviceCommandResponse)
 async def execute_device_method(
@@ -376,11 +399,28 @@ async def stop_device(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ===== Device Metadata Endpoints (proxy configuration service) =====
+async def _config_get(client: httpx.AsyncClient, path: str, *, not_found_msg: str) -> Any:
+    """GET from configuration service, translating status codes to HTTPExceptions."""
+    try:
+        response = await client.get(path)
+    except httpx.RequestError as e:
+        logger.error("config_service_fetch_error", path=path, error=str(e))
+        raise HTTPException(
+            status_code=503, detail=f"Configuration service unavailable: {e}"
+        )
+    if response.status_code == 404:
+        raise HTTPException(status_code=404, detail=not_found_msg)
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail="Failed to fetch from configuration service",
+        )
+    return response.json()
+
 
 @app.get("/api/v1/devices")
 async def list_devices(
-    settings: Settings = Depends(get_settings),
+    client: httpx.AsyncClient = Depends(get_config_http),
     device_class: Optional[str] = Query(
         None, description="Filter by ophyd class name"
     ),
@@ -389,111 +429,63 @@ async def list_devices(
     flyable: Optional[bool] = Query(None, description="Filter by Flyable"),
 ):
     """List available devices (proxied from configuration service)."""
-    import httpx
+    devices = await _config_get(
+        client, "/api/v1/devices", not_found_msg="Devices endpoint not found"
+    )
 
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(
-                f"{settings.configuration_service_url}/api/v1/devices"
-            )
-            if response.status_code != 200:
-                raise HTTPException(
-                    status_code=response.status_code,
-                    detail="Failed to fetch devices from configuration service",
-                )
-            devices = response.json()
-
-            if device_class:
-                devices = [
-                    d for d in devices
-                    if d.get("ophyd_class") == device_class
-                    or d.get("class") == device_class
-                ]
-            if readable is not None:
-                devices = [d for d in devices if d.get("is_readable", True) == readable]
-            if movable is not None:
-                devices = [d for d in devices if d.get("is_movable", False) == movable]
-            if flyable is not None:
-                devices = [d for d in devices if d.get("is_flyable", False) == flyable]
-            return devices
-    except httpx.RequestError as e:
-        logger.error("device_list_fetch_error", error=str(e))
-        raise HTTPException(
-            status_code=503, detail=f"Configuration service unavailable: {e}"
-        )
+    if device_class:
+        devices = [
+            d for d in devices
+            if d.get("ophyd_class") == device_class or d.get("class") == device_class
+        ]
+    if readable is not None:
+        devices = [d for d in devices if d.get("is_readable", True) == readable]
+    if movable is not None:
+        devices = [d for d in devices if d.get("is_movable", False) == movable]
+    if flyable is not None:
+        devices = [d for d in devices if d.get("is_flyable", False) == flyable]
+    return devices
 
 
 @app.get("/api/v1/devices/{device_name}")
 async def get_device(
     device_name: str,
-    settings: Settings = Depends(get_settings),
+    client: httpx.AsyncClient = Depends(get_config_http),
 ):
     """Get device metadata (proxied from configuration service)."""
-    import httpx
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(
-                f"{settings.configuration_service_url}/api/v1/devices/{device_name}"
-            )
-            if response.status_code == 404:
-                raise HTTPException(status_code=404, detail=f"Device not found: {device_name}")
-            if response.status_code != 200:
-                raise HTTPException(
-                    status_code=response.status_code,
-                    detail="Failed to fetch device from configuration service",
-                )
-            return response.json()
-    except httpx.RequestError as e:
-        logger.error("device_fetch_error", device_name=device_name, error=str(e))
-        raise HTTPException(
-            status_code=503, detail=f"Configuration service unavailable: {e}"
-        )
+    return await _config_get(
+        client,
+        f"/api/v1/devices/{device_name}",
+        not_found_msg=f"Device not found: {device_name}",
+    )
 
 
 @app.get("/api/v1/devices/{device_name}/bundle")
 async def get_device_bundle(
     device_name: str,
-    depth: int = Query(3, ge=1, le=10, description="Maximum depth of component tree"),
-    settings: Settings = Depends(get_settings),
+    client: httpx.AsyncClient = Depends(get_config_http),
 ):
     """Get hierarchical device component tree for building control UIs."""
-    import httpx
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(
-                f"{settings.configuration_service_url}/api/v1/devices/{device_name}"
-            )
-            if response.status_code == 404:
-                raise HTTPException(status_code=404, detail=f"Device not found: {device_name}")
-            if response.status_code != 200:
-                raise HTTPException(
-                    status_code=response.status_code,
-                    detail="Failed to fetch device from configuration service",
-                )
-            device_data = response.json()
-            pvs = device_data.get("pvs", {})
-            components = _build_component_tree(pvs, depth)
-            return {
-                "name": device_name,
-                "class": device_data.get(
-                    "ophyd_class", device_data.get("device_type", "unknown")
-                ),
-                "prefix": device_data.get("prefix"),
-                "is_readable": device_data.get("is_readable", True),
-                "is_movable": device_data.get("is_movable", False),
-                "components": components,
-                "total_signals": len(pvs),
-            }
-    except httpx.RequestError as e:
-        logger.error("device_bundle_fetch_error", device_name=device_name, error=str(e))
-        raise HTTPException(
-            status_code=503, detail=f"Configuration service unavailable: {e}"
-        )
+    device_data = await _config_get(
+        client,
+        f"/api/v1/devices/{device_name}",
+        not_found_msg=f"Device not found: {device_name}",
+    )
+    pvs = device_data.get("pvs", {})
+    return {
+        "name": device_name,
+        "class": device_data.get(
+            "ophyd_class", device_data.get("device_type", "unknown")
+        ),
+        "prefix": device_data.get("prefix"),
+        "is_readable": device_data.get("is_readable", True),
+        "is_movable": device_data.get("is_movable", False),
+        "components": _build_component_tree(pvs),
+        "total_signals": len(pvs),
+    }
 
 
-def _build_component_tree(pvs: Dict[str, str], max_depth: int) -> List[Dict[str, Any]]:
+def _build_component_tree(pvs: Dict[str, str]) -> List[Dict[str, Any]]:
     groups: Dict[str, List[Dict[str, Any]]] = {}
 
     for component_path, pv_name in pvs.items():
@@ -527,8 +519,6 @@ def _build_component_tree(pvs: Dict[str, str], max_depth: int) -> List[Dict[str,
             )
     return components
 
-
-# ===== Nested Device Endpoints (ophyd-websocket compatible) =====
 
 @app.post("/api/v1/device/{device_path:path}", response_model=NestedDeviceResponse)
 async def access_nested_device(
@@ -606,8 +596,6 @@ async def get_nested_device_value(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ===== WebSocket Endpoints =====
-
 @app.websocket("/ws/pv/monitor")
 async def websocket_pv_monitor_legacy(websocket: WebSocket):
     """PV monitoring WebSocket (legacy path)."""
@@ -637,8 +625,6 @@ async def websocket_control_socket(websocket: WebSocket):
     """
     await app.state.ws_manager.handle_client(websocket)
 
-
-# ===== Factory Function =====
 
 def create_app() -> FastAPI:
     """Factory used by CLI with uvicorn factory=True."""
