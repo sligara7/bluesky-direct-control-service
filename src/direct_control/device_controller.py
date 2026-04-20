@@ -8,7 +8,7 @@ coordination checks (A4 requirement).
 import asyncio
 from typing import Any, Optional, Dict, TYPE_CHECKING
 import structlog
-from epics import ca, caget, caput, get_pv, PV
+from epics import ca, caget, caput, get_pv
 from datetime import datetime
 
 from .models import (
@@ -268,6 +268,13 @@ class DeviceController:
                 use_put=request.use_put,
             )
     
+    async def _connect(self, pv_name: str, connection_timeout: float):
+        """Connect to a PV off-loop; returns the pyepics PV or None on failure."""
+        pv = await asyncio.to_thread(
+            get_pv, pv_name, timeout=connection_timeout, connect=True
+        )
+        return pv if pv.connected else None
+
     async def _execute_put(
         self,
         *,
@@ -287,57 +294,50 @@ class DeviceController:
           is freed and we await completion via an `asyncio.Event`.
         - `ftype`: drop to `ca.put(chid, ..., ftype=...)` which is the only
           pyepics entrypoint that accepts a forced field type.
-        """
-        loop = asyncio.get_event_loop()
 
+        Raises ControlError on connection failure or put-callback timeout so
+        the HTTP layer can surface actionable messages.
+        """
         if not use_complete and ftype is None:
-            status = await loop.run_in_executor(
-                None,
-                lambda: caput(
-                    pv_name,
-                    value,
-                    wait=wait,
-                    timeout=timeout,
-                    connection_timeout=connection_timeout,
-                ),
+            status = await asyncio.to_thread(
+                caput,
+                pv_name,
+                value,
+                wait=wait,
+                timeout=timeout,
+                connection_timeout=connection_timeout,
             )
             return bool(status and status > 0)
 
-        pv = await loop.run_in_executor(
-            None,
-            lambda: get_pv(pv_name, timeout=connection_timeout, connect=True),
-        )
-        if not pv.connected:
-            logger.warning("pv_connect_failed", pv_name=pv_name)
-            return False
+        pv = await self._connect(pv_name, connection_timeout)
+        if pv is None:
+            raise ControlError(
+                f"Failed to connect to PV {pv_name} within {connection_timeout}s"
+            )
 
         if use_complete:
+            loop = asyncio.get_running_loop()
             done = asyncio.Event()
 
             def _cb(**_kw: Any) -> None:
                 loop.call_soon_threadsafe(done.set)
 
             if ftype is not None:
-                await loop.run_in_executor(
-                    None,
-                    lambda: ca.put(pv.chid, value, wait=False, callback=_cb, ftype=ftype),
+                await asyncio.to_thread(
+                    ca.put, pv.chid, value, wait=False, callback=_cb, ftype=ftype
                 )
             else:
-                await loop.run_in_executor(
-                    None,
-                    lambda: pv.put(value, use_complete=True, callback=_cb),
-                )
+                await asyncio.to_thread(pv.put, value, use_complete=True, callback=_cb)
             try:
                 await asyncio.wait_for(done.wait(), timeout=timeout)
                 return True
             except asyncio.TimeoutError:
-                logger.warning("put_callback_timeout", pv_name=pv_name, timeout=timeout)
-                return False
+                raise ControlError(
+                    f"PV {pv_name} put-callback did not complete within {timeout}s"
+                )
 
-        # ftype without use_complete
-        status = await loop.run_in_executor(
-            None,
-            lambda: ca.put(pv.chid, value, wait=wait, timeout=timeout, ftype=ftype),
+        status = await asyncio.to_thread(
+            ca.put, pv.chid, value, wait=wait, timeout=timeout, ftype=ftype
         )
         return status == 1
 
@@ -360,39 +360,34 @@ class DeviceController:
         representation, and transport. `ftype=None` uses the native DBR type;
         setting `ftype` forces a non-native type on the wire (rare).
         """
-        loop = asyncio.get_event_loop()
         try:
             if ftype is None:
-                return await loop.run_in_executor(
-                    None,
-                    lambda: caget(
-                        pv_name,
-                        as_string=as_string,
-                        count=count,
-                        as_numpy=as_numpy,
-                        use_monitor=use_monitor,
-                        timeout=timeout,
-                        connection_timeout=connection_timeout,
-                    ),
+                return await asyncio.to_thread(
+                    caget,
+                    pv_name,
+                    as_string=as_string,
+                    count=count,
+                    as_numpy=as_numpy,
+                    use_monitor=use_monitor,
+                    timeout=timeout,
+                    connection_timeout=connection_timeout,
                 )
 
-            pv = await loop.run_in_executor(
-                None,
-                lambda: get_pv(pv_name, timeout=connection_timeout, connect=True),
-            )
-            if not pv.connected:
-                return None
-            return await loop.run_in_executor(
-                None,
-                lambda: ca.get(
+            # Combine connect + ca.get into one executor hop.
+            def _ftype_get() -> Optional[Any]:
+                pv = get_pv(pv_name, timeout=connection_timeout, connect=True)
+                if not pv.connected:
+                    return None
+                return ca.get(
                     pv.chid,
                     ftype=ftype,
                     count=count,
                     timeout=timeout,
                     as_string=as_string,
                     as_numpy=as_numpy,
-                ),
-            )
+                )
+
+            return await asyncio.to_thread(_ftype_get)
         except Exception as e:
             logger.error("get_pv_error", pv_name=pv_name, error=str(e))
             return None

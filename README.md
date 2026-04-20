@@ -127,7 +127,7 @@ Completion modes:
 | `as_string` | bool | `false` | Return string representation (enum labels, char-waveform decoded) |
 | `count` | int \| null | native | Cap waveform elements returned |
 | `as_numpy` | bool | `true` | Return arrays as numpy (JSON-serialized to list either way) |
-| `use_monitor` | bool | `true` | Use monitor cache; `false` forces fresh CA get |
+| `use_monitor` | bool | `false` | Force fresh CA get. Set `true` to share a monitor with an existing subscription — note pyepics will install a permanent auto-monitor on first such call for a PV. |
 | `timeout` | float | `5.0` | CA get timeout (seconds) |
 | `connection_timeout` | float | `5.0` | CA connection timeout (seconds) |
 | `ftype` | int \| null | native | Force non-native DBR type via `ca.get(ftype=…)` (power-user) |
@@ -201,8 +201,8 @@ curl -X POST http://localhost:8003/api/v1/pv/set \
 # Enum label instead of index, bounded connection timeout
 curl "http://localhost:8003/api/v1/pv/IOC:valve1.VAL/value?as_string=true&connection_timeout=2.0"
 
-# Fresh CA get (bypass monitor cache), waveform truncated to first 100 samples
-curl "http://localhost:8003/api/v1/pv/IOC:wf1/value?use_monitor=false&count=100"
+# Waveform truncated to first 100 samples (default is a fresh CA get)
+curl "http://localhost:8003/api/v1/pv/IOC:wf1/value?count=100"
 ```
 
 ### Get PV Value (subscription-backed, with metadata)

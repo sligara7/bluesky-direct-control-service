@@ -247,7 +247,15 @@ async def get_pv_value_from_controller(
     as_string: bool = Query(False, description="Return the string representation (e.g. enum label)"),
     count: Optional[int] = Query(None, ge=1, description="Max waveform elements to return"),
     as_numpy: bool = Query(True, description="Return arrays as numpy.ndarray (JSON-serialized to list)"),
-    use_monitor: bool = Query(True, description="Use cached monitor value (false = force fresh CA get)"),
+    use_monitor: bool = Query(
+        False,
+        description=(
+            "Use cached monitor value. Default false matches the one-shot "
+            "semantics of this endpoint; set true to share a monitor with "
+            "any existing subscription (note: pyepics auto-installs a "
+            "permanent CA monitor the first time this is true for a PV)."
+        ),
+    ),
     timeout: float = Query(5.0, gt=0, description="CA get timeout in seconds"),
     connection_timeout: float = Query(5.0, gt=0, description="CA connection timeout in seconds"),
     ftype: Optional[int] = Query(None, description="Force non-native DBR type (power user)"),
@@ -279,6 +287,11 @@ async def get_pv_value_from_controller(
     )
     if value is None:
         raise HTTPException(status_code=404, detail=f"PV {pv_name} not found or not available")
+
+    # pyepics returns numpy.ndarray for waveforms when as_numpy=True; FastAPI's
+    # default JSON encoder doesn't handle that, so coerce to a plain list.
+    if hasattr(value, "tolist"):
+        value = value.tolist()
 
     return {
         "pv_name": pv_name,
