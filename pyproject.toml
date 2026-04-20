@@ -5,14 +5,14 @@ build-backend = "hatchling.build"
 [project]
 name = "bluesky-direct-control"
 version = "1.0.0"
-description = "Direct Device Control Service (SVC-003) - Device commanding with A4 coordination checks"
+description = "Direct Device Control + Monitoring Service (SVC-003) - A4-coordinated device commanding with real-time EPICS PV monitoring via WebSocket"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "BSD-3-Clause"}
 authors = [
     {name = "Bluesky Remote Architecture Team"}
 ]
-keywords = ["bluesky", "epics", "device-control", "coordination", "ophyd"]
+keywords = ["bluesky", "epics", "device-control", "coordination", "ophyd", "pv-monitoring", "websocket"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
@@ -32,7 +32,8 @@ dependencies = [
     # Web framework
     "fastapi>=0.104.0",
     "uvicorn[standard]>=0.24.0",
-    
+    "websockets>=12.0",
+
     # Data validation
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",

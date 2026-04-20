@@ -1,42 +1,40 @@
 """
-FastAPI application for Direct Device Control Service.
+FastAPI application for the merged Direct Device Control + Monitoring Service.
 
-Note: Uses lifespan pattern to defer Settings() creation until after
-CLI sets environment variables.
+Combines A4-coordinated device commanding with EPICS PV monitoring and
+WebSocket streaming on a single port. Authorization is handled by upstream
+middleware — no auth enforcement in this service.
+
+Uses lifespan pattern to defer Settings() creation until after CLI sets
+environment variables (pyepics reads EPICS_CA_* env vars at import time).
 """
 
-import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends, Header, Query
-from fastapi.middleware.cors import CORSMiddleware
 import structlog
+from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
 
 from .config import Settings
+from .coordination_client import CoordinationClient
+from .device_controller import DeviceController
 from .models import (
-    HealthResponse,
-    PVSetRequest,
-    PVSetResponse,
+    CoordinationCheckError,
     DeviceCommandRequest,
     DeviceCommandResponse,
     DeviceLockedError,
-    CoordinationCheckError,
-    AuthorizationError,
-    WebSocketAction,
-    WebSocketSetRequest,
-    WebSocketSetResponse,
+    HealthResponse,
     NestedDeviceRequest,
     NestedDeviceResponse,
-    ValueLimitError,
+    PVNotFoundError,
+    PVSetRequest,
+    PVSetResponse,
+    PVValue,
 )
-from .protocols import CoordinationService, DeviceControl
-from .coordination_client import CoordinationClient
-from .device_controller import DeviceController
+from .protocols import CoordinationService, DeviceControl, PVMonitor
 from .registry_client import RegistryClient, RegistryValidationError
-from .auth_client import AuthClient, AuthError
-
 
 logger = structlog.get_logger(__name__)
 
@@ -45,151 +43,159 @@ logger = structlog.get_logger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Application lifecycle manager.
+    """Initialize clients and managers on startup, clean up on shutdown."""
+    logger.info("Starting Direct Device Control + Monitoring Service")
 
-    Initialize settings and clients on startup, clean up on shutdown.
-    """
-    logger.info("Starting Direct Device Control Service")
-
-    # Get settings (reads env vars set by CLI)
     settings = Settings()
 
-    # Initialize clients
+    # Import pyepics-dependent managers after env vars are in place
+    from .monitoring.device_websocket_manager import DeviceWebSocketManager
+    from .monitoring.pv_monitor import PVMonitorManager
+    from .monitoring.websocket_manager import WebSocketManager
+
     coordination_client = CoordinationClient(settings)
     device_controller = DeviceController(settings, coordination_client)
     registry_client = RegistryClient(settings)
-    auth_client = AuthClient(settings)
+    pv_monitor = PVMonitorManager(settings)
+    ws_manager = WebSocketManager(
+        pv_monitor=pv_monitor,
+        device_controller=device_controller,
+        registry_client=registry_client,
+    )
+    device_ws_manager = DeviceWebSocketManager(
+        pv_monitor=pv_monitor,
+        device_controller=device_controller,
+        settings=settings,
+    )
 
-    # Store in app state
     app.state.settings = settings
     app.state.coordination_client = coordination_client
     app.state.device_controller = device_controller
     app.state.registry_client = registry_client
-    app.state.auth_client = auth_client
+    app.state.pv_monitor = pv_monitor
+    app.state.ws_manager = ws_manager
+    app.state.device_ws_manager = device_ws_manager
 
     logger.info(
-        "Service initialized successfully",
+        "Service initialized",
         port=settings.port,
         coordination_url=settings.experiment_execution_url,
         coordination_enabled=settings.coordination_check_enabled,
-        require_auth=settings.require_auth,
     )
 
     try:
         yield
     finally:
-        # Shutdown
-        logger.info("Shutting down Direct Device Control Service")
+        logger.info("Shutting down service")
         await coordination_client.cleanup()
         await registry_client.cleanup()
-        await auth_client.cleanup()
-        logger.info("Service shut down successfully")
+        await pv_monitor.cleanup()
+        logger.info("Service shut down")
 
 
-# Create FastAPI app
 app = FastAPI(
-    title="Bluesky Direct Device Control Service",
-    description="Device commanding with A4 coordination checks",
+    title="Bluesky Direct Device Control + Monitoring",
+    description=(
+        "Device commanding with A4 coordination checks, plus real-time "
+        "EPICS PV monitoring via WebSocket."
+    ),
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan,
 )
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ===== Dependencies =====
+# ===== Dependency Injection =====
 
 def get_settings() -> Settings:
-    """Dependency injection for settings."""
     return app.state.settings
 
 
 def get_coordination_client() -> CoordinationService:
-    """Dependency injection for coordination client (implements CoordinationService protocol)."""
     return app.state.coordination_client
 
 
 def get_device_controller() -> DeviceControl:
-    """Dependency injection for device controller (implements DeviceControl protocol)."""
     return app.state.device_controller
 
 
 def get_registry_client() -> RegistryClient:
-    """Dependency injection for registry client."""
     return app.state.registry_client
 
 
-def get_auth_client() -> AuthClient:
-    """Dependency injection for auth client."""
-    return app.state.auth_client
+def get_pv_monitor() -> PVMonitor:
+    return app.state.pv_monitor
 
 
-async def require_command_device(
-    authorization: Optional[str] = Header(None),
-    auth_client: AuthClient = Depends(get_auth_client),
-) -> dict:
-    """Auth dependency: requires COMMAND_DEVICE permission for write operations."""
-    try:
-        return await auth_client.require_permission(authorization, "COMMAND_DEVICE")
-    except AuthError as e:
-        raise HTTPException(status_code=e.status_code, detail=e.detail)
+def get_ws_manager():
+    return app.state.ws_manager
 
 
-async def require_stop_device(
-    authorization: Optional[str] = Header(None),
-    auth_client: AuthClient = Depends(get_auth_client),
-) -> dict:
-    """Auth dependency: requires STOP_DEVICE permission for stop operations."""
-    try:
-        return await auth_client.require_permission(authorization, "STOP_DEVICE")
-    except AuthError as e:
-        raise HTTPException(status_code=e.status_code, detail=e.detail)
+def get_device_ws_manager():
+    return app.state.device_ws_manager
 
 
-async def require_monitor_devices(
-    authorization: Optional[str] = Header(None),
-    auth_client: AuthClient = Depends(get_auth_client),
-) -> dict:
-    """Auth dependency: requires MONITOR_DEVICES permission for read operations."""
-    try:
-        return await auth_client.require_permission(authorization, "MONITOR_DEVICES")
-    except AuthError as e:
-        raise HTTPException(status_code=e.status_code, detail=e.detail)
-
-
-# ===== Health & Readiness =====
+# ===== Health & Stats =====
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check(
     coordination_client: CoordinationService = Depends(get_coordination_client),
+    pv_monitor: PVMonitor = Depends(get_pv_monitor),
+    ws_manager=Depends(get_ws_manager),
 ):
-    """
-    Health check endpoint.
-
-    Returns:
-        Service health status
-    """
+    """Combined health check: coordination availability and monitoring stats."""
     coord_available = await coordination_client.is_service_available()
-
-    # In full implementation, also check auth service
-    auth_available = True  # Placeholder
+    stats = ws_manager.get_stats()
 
     return HealthResponse(
         status="healthy" if coord_available else "degraded",
         timestamp=datetime.now(),
         coordination_service_available=coord_available,
-        auth_service_available=auth_available,
+        active_subscriptions=len(pv_monitor.get_connected_pvs()),
+        connected_pvs=stats["connected_pvs"],
+        websocket_connections=stats["active_connections"],
     )
+
+
+@app.get("/api/v1/stats")
+async def get_stats(
+    settings: Settings = Depends(get_settings),
+    coordination_client: CoordinationService = Depends(get_coordination_client),
+    ws_manager=Depends(get_ws_manager),
+    device_ws_manager=Depends(get_device_ws_manager),
+):
+    coord_available = await coordination_client.is_service_available()
+    pv_stats = ws_manager.get_stats()
+    device_stats = device_ws_manager.get_stats()
+
+    return {
+        "service": "direct_control",
+        "timestamp": datetime.now().isoformat(),
+        "coordination_enabled": settings.coordination_check_enabled,
+        "coordination_service_available": coord_available,
+        "command_timeout": settings.command_timeout,
+        "pv_socket": {
+            "websocket_connections": pv_stats["active_connections"],
+            "total_pvs": pv_stats["total_pvs"],
+            "connected_pvs": pv_stats["connected_pvs"],
+        },
+        "device_socket": {
+            "websocket_connections": device_stats["active_connections"],
+            "subscribed_devices": device_stats["subscribed_devices"],
+            "total_device_pvs": device_stats["total_device_pvs"],
+        },
+        "buffer_size": settings.pv_buffer_size,
+        "max_connections": settings.ws_max_connections,
+    }
 
 
 # ===== PV Control Endpoints =====
@@ -197,37 +203,18 @@ async def health_check(
 @app.post("/api/v1/pv/set", response_model=PVSetResponse)
 async def set_pv(
     request: PVSetRequest,
-    auth: dict = Depends(require_command_device),
     device_controller: DeviceControl = Depends(get_device_controller),
     registry_client: RegistryClient = Depends(get_registry_client),
 ):
     """
     Set EPICS PV value with coordination check (Low Fidelity Channel).
 
-    This is the "low fidelity" command channel with two modes:
+    Two modes:
+    - wait=False (fire-and-forget, default): Issues write, returns immediately.
+    - wait=True (put-completion): Waits for EPICS put-completion callback.
 
-    1. **Fire-and-forget (wait=false, default)**: Issues PV write and returns
-       immediately. Client should monitor PV readback for feedback. Ideal for
-       motor jogging and simple signal adjustments.
-
-    2. **Put-completion (wait=true)**: Waits for EPICS put-completion callback
-       and returns confirmed result. Use when confirmation is required.
-
-    This endpoint implements the A4 coordination requirement by checking
-    with SVC-001 (Experiment Execution Service) before allowing the command.
-
-    Args:
-        request: PV set request with optional wait parameter
-        auth: Validated user info (requires COMMAND_DEVICE permission)
-
-    Returns:
-        PV set response with mode indication
-
-    Raises:
-        HTTPException 404: If PV not in registry
-        HTTPException 423: If device is locked by active plan
-        HTTPException 503: If coordination check fails
-        HTTPException 500: If operation fails
+    Raises 404 if PV not in registry, 423 if device locked, 503 if
+    coordination service unavailable.
     """
     try:
         await registry_client.validate_pv(request.pv_name)
@@ -237,38 +224,25 @@ async def set_pv(
         raise HTTPException(status_code=503, detail=str(e))
 
     try:
-        response = await device_controller.set_pv(request)
-        return response
-
+        return await device_controller.set_pv(request)
     except DeviceLockedError as e:
         logger.warning("pv_locked", pv_name=request.pv_name, error=str(e))
-        raise HTTPException(status_code=423, detail=str(e))  # 423 Locked
-
+        raise HTTPException(status_code=423, detail=str(e))
     except CoordinationCheckError as e:
         logger.error("coordination_check_failed", pv_name=request.pv_name, error=str(e))
         raise HTTPException(status_code=503, detail=f"Coordination check failed: {e}")
-
     except Exception as e:
         logger.error("set_pv_error", pv_name=request.pv_name, error=str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/v1/pv/{pv_name}/value")
-async def get_pv_value(
+async def get_pv_value_from_controller(
     pv_name: str,
-    auth: dict = Depends(require_monitor_devices),
     device_controller: DeviceControl = Depends(get_device_controller),
     registry_client: RegistryClient = Depends(get_registry_client),
 ):
-    """
-    Get current PV value (read-only, no coordination check).
-
-    Args:
-        pv_name: EPICS PV name
-
-    Returns:
-        Current PV value
-    """
+    """One-shot CA get via DeviceController (no subscription)."""
     try:
         await registry_client.validate_pv(pv_name)
     except RegistryValidationError as e:
@@ -277,7 +251,6 @@ async def get_pv_value(
         raise HTTPException(status_code=503, detail=str(e))
 
     value = await device_controller.get_pv_value(pv_name)
-
     if value is None:
         raise HTTPException(status_code=404, detail=f"PV {pv_name} not found or not available")
 
@@ -288,41 +261,64 @@ async def get_pv_value(
     }
 
 
+# ===== Monitored PV Endpoints (subscription-backed) =====
+
+@app.get("/api/v1/pvs/{pv_name}/value", response_model=PVValue)
+async def get_monitored_pv_value(
+    pv_name: str,
+    pv_monitor: PVMonitor = Depends(get_pv_monitor),
+    registry_client: RegistryClient = Depends(get_registry_client),
+):
+    """
+    Get current value of a PV from the monitoring subscription cache.
+
+    Subscribes to the PV if not already subscribed. Returns full metadata
+    (units, precision, limits, access flags).
+    """
+    try:
+        await registry_client.validate_pv(pv_name)
+    except RegistryValidationError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+    try:
+        if not pv_monitor.is_connected(pv_name):
+            pv_monitor.subscribe(pv_name)
+
+        value = pv_monitor.get_value(pv_name)
+        if not value:
+            raise HTTPException(status_code=404, detail=f"PV {pv_name} not found")
+        return value
+    except HTTPException:
+        raise
+    except PVNotFoundError as e:
+        logger.warning("pv_not_found", pv_name=pv_name, error=str(e))
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error("get_monitored_pv_error", pv_name=pv_name, error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/pvs/connected", response_model=list[str])
+async def get_connected_pvs(pv_monitor: PVMonitor = Depends(get_pv_monitor)):
+    """List PVs currently connected in the monitoring subsystem."""
+    return pv_monitor.get_connected_pvs()
+
+
 # ===== Device Control Endpoints =====
 
 @app.post("/api/v1/device/execute", response_model=DeviceCommandResponse)
 async def execute_device_method(
     request: DeviceCommandRequest,
-    auth: dict = Depends(require_command_device),
     device_controller: DeviceControl = Depends(get_device_controller),
     registry_client: RegistryClient = Depends(get_registry_client),
 ):
     """
     Execute Ophyd device method with coordination check (High Fidelity Channel).
 
-    This is the "high fidelity" command channel - consistent single path that
-    ALWAYS returns a confirmed result. Unlike the PV channel, there is no
-    fire-and-forget mode.
-
-    Use this channel when:
-    - Confirmation of operation completion is required
-    - Invoking Ophyd device methods (set, move, trigger, etc.)
-
-    This endpoint implements the A4 coordination requirement by checking
-    with SVC-001 before allowing device commands.
-
-    Args:
-        request: Device command request
-        auth: Validated user info (requires COMMAND_DEVICE permission)
-
-    Returns:
-        Device command response (always confirmed)
-
-    Raises:
-        HTTPException 404: If device not in registry
-        HTTPException 423: If device is locked by active plan
-        HTTPException 503: If coordination check fails
-        HTTPException 500: If operation fails
+    Always returns a confirmed result. Use when confirmation is required.
+    Raises 404/423/503/500 on various failure modes.
     """
     try:
         await registry_client.validate_device(request.device_name)
@@ -332,27 +328,21 @@ async def execute_device_method(
         raise HTTPException(status_code=503, detail=str(e))
 
     try:
-        response = await device_controller.execute_device_method(request)
-        return response
-
+        return await device_controller.execute_device_method(request)
     except DeviceLockedError as e:
         logger.warning("device_locked", device_name=request.device_name, error=str(e))
         raise HTTPException(status_code=423, detail=str(e))
-
     except CoordinationCheckError as e:
         logger.error(
-            "coordination_check_failed",
-            device_name=request.device_name,
-            error=str(e)
+            "coordination_check_failed", device_name=request.device_name, error=str(e)
         )
         raise HTTPException(status_code=503, detail=f"Coordination check failed: {e}")
-
     except Exception as e:
         logger.error(
             "device_command_error",
             device_name=request.device_name,
             error=str(e),
-            exc_info=True
+            exc_info=True,
         )
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -360,27 +350,10 @@ async def execute_device_method(
 @app.post("/api/v1/device/{device_name}/stop", response_model=DeviceCommandResponse)
 async def stop_device(
     device_name: str,
-    auth: dict = Depends(require_stop_device),
     device_controller: DeviceControl = Depends(get_device_controller),
     registry_client: RegistryClient = Depends(get_registry_client),
 ):
-    """
-    Stop a device (as-ophyd-api compatible).
-
-    Calls the stop() method on the device if available. This is typically
-    used to abort a motor move or other ongoing operation.
-
-    Args:
-        device_name: Name of the device to stop
-
-    Returns:
-        Device command response with stop result
-
-    Raises:
-        HTTPException 404: If device not in registry
-        HTTPException 423: If device is locked by active plan
-        HTTPException 500: If stop operation fails
-    """
+    """Stop a device (calls the device's stop() method with coordination check)."""
     try:
         await registry_client.validate_device(device_name)
     except RegistryValidationError as e:
@@ -389,27 +362,170 @@ async def stop_device(
         raise HTTPException(status_code=503, detail=str(e))
 
     try:
-        # Create a command request for the stop method
-        request = DeviceCommandRequest(
-            device_name=device_name,
-            method="stop",
-            args=[],
-            kwargs={},
+        return await device_controller.execute_device_method(
+            DeviceCommandRequest(device_name=device_name, method="stop", args=[], kwargs={})
         )
-        response = await device_controller.execute_device_method(request)
-        return response
-
     except DeviceLockedError as e:
         logger.warning("device_stop_locked", device_name=device_name, error=str(e))
         raise HTTPException(status_code=423, detail=str(e))
-
     except CoordinationCheckError as e:
         logger.error("coordination_check_failed", device_name=device_name, error=str(e))
         raise HTTPException(status_code=503, detail=f"Coordination check failed: {e}")
-
     except Exception as e:
         logger.error("device_stop_error", device_name=device_name, error=str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ===== Device Metadata Endpoints (proxy configuration service) =====
+
+@app.get("/api/v1/devices")
+async def list_devices(
+    settings: Settings = Depends(get_settings),
+    device_class: Optional[str] = Query(
+        None, description="Filter by ophyd class name"
+    ),
+    readable: Optional[bool] = Query(None, description="Filter by Readable"),
+    movable: Optional[bool] = Query(None, description="Filter by Movable"),
+    flyable: Optional[bool] = Query(None, description="Filter by Flyable"),
+):
+    """List available devices (proxied from configuration service)."""
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                f"{settings.configuration_service_url}/api/v1/devices"
+            )
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail="Failed to fetch devices from configuration service",
+                )
+            devices = response.json()
+
+            if device_class:
+                devices = [
+                    d for d in devices
+                    if d.get("ophyd_class") == device_class
+                    or d.get("class") == device_class
+                ]
+            if readable is not None:
+                devices = [d for d in devices if d.get("is_readable", True) == readable]
+            if movable is not None:
+                devices = [d for d in devices if d.get("is_movable", False) == movable]
+            if flyable is not None:
+                devices = [d for d in devices if d.get("is_flyable", False) == flyable]
+            return devices
+    except httpx.RequestError as e:
+        logger.error("device_list_fetch_error", error=str(e))
+        raise HTTPException(
+            status_code=503, detail=f"Configuration service unavailable: {e}"
+        )
+
+
+@app.get("/api/v1/devices/{device_name}")
+async def get_device(
+    device_name: str,
+    settings: Settings = Depends(get_settings),
+):
+    """Get device metadata (proxied from configuration service)."""
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                f"{settings.configuration_service_url}/api/v1/devices/{device_name}"
+            )
+            if response.status_code == 404:
+                raise HTTPException(status_code=404, detail=f"Device not found: {device_name}")
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail="Failed to fetch device from configuration service",
+                )
+            return response.json()
+    except httpx.RequestError as e:
+        logger.error("device_fetch_error", device_name=device_name, error=str(e))
+        raise HTTPException(
+            status_code=503, detail=f"Configuration service unavailable: {e}"
+        )
+
+
+@app.get("/api/v1/devices/{device_name}/bundle")
+async def get_device_bundle(
+    device_name: str,
+    depth: int = Query(3, ge=1, le=10, description="Maximum depth of component tree"),
+    settings: Settings = Depends(get_settings),
+):
+    """Get hierarchical device component tree for building control UIs."""
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                f"{settings.configuration_service_url}/api/v1/devices/{device_name}"
+            )
+            if response.status_code == 404:
+                raise HTTPException(status_code=404, detail=f"Device not found: {device_name}")
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail="Failed to fetch device from configuration service",
+                )
+            device_data = response.json()
+            pvs = device_data.get("pvs", {})
+            components = _build_component_tree(pvs, depth)
+            return {
+                "name": device_name,
+                "class": device_data.get(
+                    "ophyd_class", device_data.get("device_type", "unknown")
+                ),
+                "prefix": device_data.get("prefix"),
+                "is_readable": device_data.get("is_readable", True),
+                "is_movable": device_data.get("is_movable", False),
+                "components": components,
+                "total_signals": len(pvs),
+            }
+    except httpx.RequestError as e:
+        logger.error("device_bundle_fetch_error", device_name=device_name, error=str(e))
+        raise HTTPException(
+            status_code=503, detail=f"Configuration service unavailable: {e}"
+        )
+
+
+def _build_component_tree(pvs: Dict[str, str], max_depth: int) -> List[Dict[str, Any]]:
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+
+    for component_path, pv_name in pvs.items():
+        parts = component_path.split(".")
+        top_level = parts[0] if parts else component_path
+        groups.setdefault(top_level, []).append(
+            {
+                "name": component_path,
+                "attr": parts[-1] if parts else component_path,
+                "pv": pv_name,
+                "type": "signal",
+                "read_only": any(
+                    ro in pv_name.upper()
+                    for ro in ["RBV", "READBACK", "STAT", "_RBK", "_MON"]
+                ),
+            }
+        )
+
+    components = []
+    for group_name, signals in groups.items():
+        if len(signals) == 1 and signals[0]["attr"] == group_name:
+            components.append(signals[0])
+        else:
+            components.append(
+                {
+                    "name": group_name,
+                    "attr": group_name,
+                    "type": "device",
+                    "components": signals,
+                }
+            )
+    return components
 
 
 # ===== Nested Device Endpoints (ophyd-websocket compatible) =====
@@ -418,26 +534,14 @@ async def stop_device(
 async def access_nested_device(
     device_path: str,
     request: Optional[NestedDeviceRequest] = None,
-    auth: dict = Depends(require_command_device),
     device_controller: DeviceControl = Depends(get_device_controller),
     registry_client: RegistryClient = Depends(get_registry_client),
 ):
     """
-    Access nested device component (ophyd-websocket compatible).
+    Access nested device component (e.g. motor1.user_readback).
 
-    Supports paths like:
-    - motor1
-    - motor1.user_readback
-    - detector.image.array_size
-
-    Args:
-        device_path: Dot-separated device component path
-        request: Optional request body for set operations
-
-    Returns:
-        Nested device response with value or operation result
+    Coordination-checked for writes; 404/423/503/500 on failure modes.
     """
-    # Validate the top-level device name
     device_name = device_path.split(".")[0]
     try:
         await registry_client.validate_device(device_name)
@@ -451,14 +555,9 @@ async def access_nested_device(
     timeout = request.timeout if request else None
 
     try:
-        # Parse device path and resolve component
         result = await device_controller.access_nested_device(
-            device_path=device_path,
-            method=method,
-            value=value,
-            timeout=timeout,
+            device_path=device_path, method=method, value=value, timeout=timeout
         )
-
         return NestedDeviceResponse(
             device_path=device_path,
             method=method,
@@ -467,15 +566,12 @@ async def access_nested_device(
             timestamp=datetime.now(),
             message=None,
         )
-
     except DeviceLockedError as e:
         logger.warning("nested_device_locked", device_path=device_path, error=str(e))
         raise HTTPException(status_code=423, detail=str(e))
-
     except CoordinationCheckError as e:
         logger.error("coordination_check_failed", device_path=device_path, error=str(e))
         raise HTTPException(status_code=503, detail=f"Coordination check failed: {e}")
-
     except Exception as e:
         logger.error("nested_device_error", device_path=device_path, error=str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -484,21 +580,10 @@ async def access_nested_device(
 @app.get("/api/v1/device/{device_path:path}/value")
 async def get_nested_device_value(
     device_path: str,
-    auth: dict = Depends(require_monitor_devices),
     device_controller: DeviceControl = Depends(get_device_controller),
     registry_client: RegistryClient = Depends(get_registry_client),
 ):
-    """
-    Get nested device component value (read-only, no coordination check).
-
-    Supports paths like motor1.user_readback.
-
-    Args:
-        device_path: Dot-separated device component path
-
-    Returns:
-        Current device component value
-    """
+    """Get nested device component value (read-only, no coordination check)."""
     device_name = device_path.split(".")[0]
     try:
         await registry_client.validate_device(device_name)
@@ -509,464 +594,52 @@ async def get_nested_device_value(
 
     try:
         value = await device_controller.access_nested_device(
-            device_path=device_path,
-            method="read",
-            value=None,
-            timeout=None,
+            device_path=device_path, method="read", value=None, timeout=None
         )
-
         return {
             "device_path": device_path,
             "value": value,
             "timestamp": datetime.now().isoformat(),
         }
-
     except Exception as e:
         logger.error("nested_device_read_error", device_path=device_path, error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ===== WebSocket Control Endpoint (ophyd-websocket compatible) =====
+# ===== WebSocket Endpoints =====
+
+@app.websocket("/ws/pv/monitor")
+async def websocket_pv_monitor_legacy(websocket: WebSocket):
+    """PV monitoring WebSocket (legacy path)."""
+    await app.state.ws_manager.handle_client(websocket)
+
+
+@app.websocket("/api/v1/pv-socket")
+async def websocket_pv_socket(websocket: WebSocket):
+    """PV monitoring WebSocket (ophyd-websocket compatible)."""
+    await app.state.ws_manager.handle_client(websocket)
+
+
+@app.websocket("/api/v1/device-socket")
+async def websocket_device_socket(websocket: WebSocket):
+    """Device-level monitoring WebSocket (ophyd-websocket compatible)."""
+    await app.state.device_ws_manager.handle_client(websocket)
+
 
 @app.websocket("/api/v1/control-socket")
-async def websocket_control(
-    websocket: WebSocket,
-    token: Optional[str] = Query(None),
-    device_controller: DeviceControl = Depends(get_device_controller),
-):
+async def websocket_control_socket(websocket: WebSocket):
     """
-    WebSocket endpoint for device control (ophyd-websocket compatible).
+    Combined PV + device control WebSocket (ophyd-websocket compatible).
 
-    Authentication: Pass token via query param ?token=<jwt> or send
-    {"action": "auth", "token": "..."} as first message within 5 seconds.
-
-    Protocol:
-        Client -> Server:
-            {"action": "auth", "token": "..."}  (if no query param token)
-            {"action": "set", "pv": "IOC:m1", "value": 10}
-            {"action": "set", "device": "motor1", "component": "user_readback", "value": 10}
-            {"action": "get", "pv": "IOC:m1"}
-            {"action": "ping"}
-
-        Server -> Client:
-            {"type": "set_complete", "pv": "...", "success": true, ...}
-            {"type": "value", "pv": "...", "value": ..., ...}
-            {"type": "pong", "timestamp": "..."}
-            {"type": "error", "message": "...", ...}
+    Writes (set/stop) go through DeviceControl so coordination checks apply.
+    This is served by the same WebSocketManager that handles pv-socket; set
+    and stop operations are automatically coordination-checked.
     """
-    auth_client: AuthClient = app.state.auth_client
-    registry_client: RegistryClient = app.state.registry_client
-
-    await websocket.accept()
-
-    # Authenticate the WebSocket connection
-    ws_user = None
-    if token:
-        ws_user = await auth_client.require_permission_ws(token, "MONITOR_DEVICES")
-    elif auth_client.require_auth:
-        # Wait for auth message within 5 seconds
-        try:
-            data = await asyncio.wait_for(websocket.receive_json(), timeout=5.0)
-            if data.get("action") == "auth" and data.get("token"):
-                ws_user = await auth_client.require_permission_ws(
-                    data["token"], "MONITOR_DEVICES"
-                )
-            else:
-                await websocket.send_json({
-                    "type": "error",
-                    "message": "First message must be auth with token",
-                    "timestamp": datetime.now().isoformat(),
-                })
-                await websocket.close(code=4001, reason="Authentication required")
-                return
-        except asyncio.TimeoutError:
-            await websocket.close(code=4001, reason="Authentication timeout")
-            return
-    else:
-        ws_user = {"user_id": "anonymous"}
-
-    if ws_user is None:
-        await websocket.close(code=4001, reason="Invalid token")
-        return
-
-    logger.info("control_websocket_connected", user=ws_user.get("user_id"))
-
-    # Store the token for per-action permission escalation checks
-    ws_token = token
-
-    try:
-        while True:
-            data = await websocket.receive_json()
-
-            action = data.get("action", "").lower()
-
-            if action == "auth":
-                # Allow re-auth / token upgrade mid-session
-                new_token = data.get("token")
-                if new_token:
-                    ws_token = new_token
-                    ws_user = await auth_client.require_permission_ws(new_token, "MONITOR_DEVICES")
-                    if ws_user:
-                        await websocket.send_json({
-                            "type": "auth_ok",
-                            "user_id": ws_user.get("user_id"),
-                            "timestamp": datetime.now().isoformat(),
-                        })
-                    else:
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": "Invalid token",
-                            "timestamp": datetime.now().isoformat(),
-                        })
-
-            elif action == "ping":
-                await websocket.send_json({
-                    "type": "pong",
-                    "timestamp": datetime.now().isoformat(),
-                })
-
-            elif action == "set":
-                # Requires COMMAND_DEVICE permission
-                if auth_client.require_auth:
-                    user = await auth_client.require_permission_ws(ws_token, "COMMAND_DEVICE")
-                    if not user:
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": "Permission 'COMMAND_DEVICE' required",
-                            "timestamp": datetime.now().isoformat(),
-                        })
-                        continue
-
-                await _handle_websocket_set(websocket, data, device_controller, registry_client)
-
-            elif action == "get":
-                # MONITOR_DEVICES already checked at connection level
-                await _handle_websocket_get(websocket, data, device_controller, registry_client)
-
-            elif action == "stop":
-                # Requires STOP_DEVICE permission
-                if auth_client.require_auth:
-                    user = await auth_client.require_permission_ws(ws_token, "STOP_DEVICE")
-                    if not user:
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": "Permission 'STOP_DEVICE' required",
-                            "timestamp": datetime.now().isoformat(),
-                        })
-                        continue
-
-                await _handle_websocket_stop(websocket, data, device_controller, registry_client)
-
-            else:
-                await websocket.send_json({
-                    "type": "error",
-                    "message": f"Unknown action: {action}",
-                    "timestamp": datetime.now().isoformat(),
-                })
-
-    except WebSocketDisconnect:
-        logger.info("control_websocket_disconnected")
-
-    except Exception as e:
-        logger.error("control_websocket_error", error=str(e), exc_info=True)
-        try:
-            await websocket.close(code=1011, reason="Internal server error")
-        except Exception:
-            pass
-
-
-async def _handle_websocket_set(
-    websocket: WebSocket,
-    data: dict,
-    device_controller: DeviceControl,
-    registry_client: RegistryClient,
-):
-    """Handle WebSocket set action (as-ophyd-api compatible with use_put option)."""
-    pv = data.get("pv")
-    device = data.get("device")
-    component = data.get("component")
-    value = data.get("value")
-    timeout = data.get("timeout")
-    use_put = data.get("use_put", False)  # as-ophyd-api compatible
-
-    if value is None:
-        await websocket.send_json({
-            "type": "error",
-            "message": "value field required for set action",
-            "timestamp": datetime.now().isoformat(),
-        })
-        return
-
-    # Registry validation
-    try:
-        if pv:
-            await registry_client.validate_pv(pv)
-        elif device:
-            await registry_client.validate_device(device)
-        else:
-            await websocket.send_json({
-                "type": "error",
-                "message": "pv or device field required for set action",
-                "timestamp": datetime.now().isoformat(),
-            })
-            return
-    except RegistryValidationError as e:
-        await websocket.send_json({
-            "type": "error",
-            "message": str(e),
-            "timestamp": datetime.now().isoformat(),
-        })
-        return
-    except RuntimeError as e:
-        await websocket.send_json({
-            "type": "error",
-            "message": str(e),
-            "timestamp": datetime.now().isoformat(),
-        })
-        return
-
-    try:
-        if pv:
-            # PV set - use_put controls wait behavior
-            # use_put=True -> wait=False (fire-and-forget)
-            # use_put=False -> wait=True (wait for completion)
-            request = PVSetRequest(pv_name=pv, value=value, wait=not use_put, timeout=timeout)
-            response = await device_controller.set_pv(request)
-
-            await websocket.send_json({
-                "type": "set_complete",
-                "pv": pv,
-                "value": value,
-                "success": response.success,
-                "message": response.message,
-                "use_put": use_put,
-                "timestamp": datetime.now().isoformat(),
-            })
-
-        elif device:
-            # Device set (with optional nested component)
-            # For device commands, use_put would affect ophyd set() vs put()
-            device_path = f"{device}.{component}" if component else device
-            method = "put" if use_put else "set"
-            result = await device_controller.access_nested_device(
-                device_path=device_path,
-                method=method,
-                value=value,
-                timeout=timeout,
-            )
-
-            await websocket.send_json({
-                "type": "set_complete",
-                "device": device,
-                "component": component,
-                "value": value,
-                "success": True,
-                "result": result,
-                "use_put": use_put,
-                "timestamp": datetime.now().isoformat(),
-            })
-
-    except DeviceLockedError as e:
-        await websocket.send_json({
-            "type": "error",
-            "message": str(e),
-            "pv": pv,
-            "device": device,
-            "locked": True,
-            "timestamp": datetime.now().isoformat(),
-        })
-
-    except Exception as e:
-        await websocket.send_json({
-            "type": "error",
-            "message": str(e),
-            "pv": pv,
-            "device": device,
-            "timestamp": datetime.now().isoformat(),
-        })
-
-
-async def _handle_websocket_get(
-    websocket: WebSocket,
-    data: dict,
-    device_controller: DeviceControl,
-    registry_client: RegistryClient,
-):
-    """Handle WebSocket get action."""
-    pv = data.get("pv")
-    device = data.get("device")
-    component = data.get("component")
-
-    # Registry validation
-    try:
-        if pv:
-            await registry_client.validate_pv(pv)
-        elif device:
-            await registry_client.validate_device(device)
-        else:
-            await websocket.send_json({
-                "type": "error",
-                "message": "pv or device field required for get action",
-                "timestamp": datetime.now().isoformat(),
-            })
-            return
-    except RegistryValidationError as e:
-        await websocket.send_json({
-            "type": "error",
-            "message": str(e),
-            "timestamp": datetime.now().isoformat(),
-        })
-        return
-    except RuntimeError as e:
-        await websocket.send_json({
-            "type": "error",
-            "message": str(e),
-            "timestamp": datetime.now().isoformat(),
-        })
-        return
-
-    try:
-        if pv:
-            # PV get
-            value = await device_controller.get_pv_value(pv)
-
-            await websocket.send_json({
-                "type": "value",
-                "pv": pv,
-                "value": value,
-                "timestamp": datetime.now().isoformat(),
-            })
-
-        elif device:
-            # Device get (with optional nested component)
-            device_path = f"{device}.{component}" if component else device
-            value = await device_controller.access_nested_device(
-                device_path=device_path,
-                method="read",
-                value=None,
-                timeout=None,
-            )
-
-            await websocket.send_json({
-                "type": "value",
-                "device": device,
-                "component": component,
-                "value": value,
-                "timestamp": datetime.now().isoformat(),
-            })
-
-    except Exception as e:
-        await websocket.send_json({
-            "type": "error",
-            "message": str(e),
-            "pv": pv,
-            "device": device,
-            "timestamp": datetime.now().isoformat(),
-        })
-
-
-async def _handle_websocket_stop(
-    websocket: WebSocket,
-    data: dict,
-    device_controller: DeviceControl,
-    registry_client: RegistryClient,
-):
-    """Handle WebSocket stop action (as-ophyd-api compatible)."""
-    device = data.get("device")
-
-    if not device:
-        await websocket.send_json({
-            "type": "error",
-            "message": "device field required for stop action",
-            "timestamp": datetime.now().isoformat(),
-        })
-        return
-
-    # Registry validation
-    try:
-        await registry_client.validate_device(device)
-    except RegistryValidationError as e:
-        await websocket.send_json({
-            "type": "error",
-            "message": str(e),
-            "timestamp": datetime.now().isoformat(),
-        })
-        return
-    except RuntimeError as e:
-        await websocket.send_json({
-            "type": "error",
-            "message": str(e),
-            "timestamp": datetime.now().isoformat(),
-        })
-        return
-
-    try:
-        # Create a command request for the stop method
-        request = DeviceCommandRequest(
-            device_name=device,
-            method="stop",
-            args=[],
-            kwargs={},
-        )
-        response = await device_controller.execute_device_method(request)
-
-        await websocket.send_json({
-            "type": "stop_complete",
-            "device": device,
-            "success": response.success,
-            "message": response.message or "Device stopped",
-            "timestamp": datetime.now().isoformat(),
-        })
-
-    except DeviceLockedError as e:
-        await websocket.send_json({
-            "type": "error",
-            "message": str(e),
-            "device": device,
-            "locked": True,
-            "timestamp": datetime.now().isoformat(),
-        })
-
-    except Exception as e:
-        await websocket.send_json({
-            "type": "error",
-            "message": str(e),
-            "device": device,
-            "timestamp": datetime.now().isoformat(),
-        })
-
-
-# ===== Statistics Endpoint =====
-
-@app.get("/api/v1/stats")
-async def get_stats(
-    settings: Settings = Depends(get_settings),
-    coordination_client: CoordinationService = Depends(get_coordination_client),
-):
-    """
-    Get service statistics.
-
-    Returns:
-        Service statistics
-    """
-    coord_available = await coordination_client.is_service_available()
-
-    return {
-        "service": "direct_control",
-        "timestamp": datetime.now().isoformat(),
-        "coordination_enabled": settings.coordination_check_enabled,
-        "coordination_service_available": coord_available,
-        "command_timeout": settings.command_timeout,
-    }
+    await app.state.ws_manager.handle_client(websocket)
 
 
 # ===== Factory Function =====
 
 def create_app() -> FastAPI:
-    """
-    Factory function for creating the FastAPI app.
-
-    Used by CLI with uvicorn's factory=True parameter to ensure
-    environment variables are set before Settings() is created.
-    """
+    """Factory used by CLI with uvicorn factory=True."""
     return app

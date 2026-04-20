@@ -1,19 +1,28 @@
 openapi: 3.1.0
 info:
-  title: Bluesky Direct Device Control Service
+  title: Bluesky Direct Device Control + Monitoring Service
   version: 1.0.0
   description: |
-    Device commanding with A4 coordination checks.
-    
-    This service provides two command channels:
-    
+    A4-coordinated device commanding plus real-time EPICS PV monitoring
+    via WebSocket, on a single port (default 8003).
+
+    > **Canonical spec**: the service exposes its own auto-generated spec at
+    > `/openapi.json` (interactive at `/docs`). This YAML file documents the
+    > original control endpoints but **does not** enumerate the merged
+    > monitoring endpoints (`/api/v1/pvs/*`, `/api/v1/devices*`, `/ws/pv/monitor`,
+    > `/api/v1/pv-socket`, `/api/v1/device-socket`, `/api/v1/control-socket`).
+    > For those, fetch `/openapi.json` at runtime.
+
     **Low Fidelity Channel** (`/api/v1/pv/set`):
     - Fire-and-forget mode for rapid PV writes (motor jogging)
     - Put-completion mode when confirmation is required
-    
+
     **High Fidelity Channel** (`/api/v1/device/execute`):
     - Always returns confirmed results
     - For Ophyd device method invocation (set, move, trigger, etc.)
+
+    Authorization: handled by upstream middleware; this service performs no
+    auth enforcement.
 
 servers:
   - url: /
@@ -334,9 +343,15 @@ components:
         coordination_service_available:
           type: boolean
           description: Coordination service reachable
-        auth_service_available:
-          type: boolean
-          description: Auth service reachable
+        active_subscriptions:
+          type: integer
+          description: Number of active PV subscriptions
+        connected_pvs:
+          type: integer
+          description: Number of connected PVs
+        websocket_connections:
+          type: integer
+          description: Number of active WebSocket connections
       additionalProperties: false
 
     # -------------------------------------------------------------------------

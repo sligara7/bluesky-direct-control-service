@@ -32,8 +32,8 @@ class RegistryClient:
     """
     HTTP client for validating PV/device existence against Configuration Service.
 
-    Always enforced, even when require_auth=false. Every PV/device operation
-    must confirm the target exists in the authoritative registry.
+    Every PV/device operation must confirm the target exists in the
+    authoritative registry before reaching EPICS.
 
     Uses a TTL cache (30s default) to avoid per-request HTTP round-trips.
     """

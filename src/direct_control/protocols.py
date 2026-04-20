@@ -14,14 +14,16 @@ These protocols enable:
 """
 
 from datetime import datetime
-from typing import Any, Optional, Protocol, runtime_checkable
+from typing import Any, Callable, List, Optional, Protocol, runtime_checkable
 
 from .models import (
     CoordinationStatus,
-    PVSetRequest,
-    PVSetResponse,
     DeviceCommandRequest,
     DeviceCommandResponse,
+    PVSetRequest,
+    PVSetResponse,
+    PVUpdate,
+    PVValue,
 )
 
 
@@ -205,3 +207,136 @@ class MockCoordinationClient:
     async def cleanup(self) -> None:
         """No cleanup needed for mock."""
         pass
+
+
+@runtime_checkable
+class PVMonitor(Protocol):
+    """
+    Protocol for EPICS PV monitoring.
+
+    Defines the interface for subscribing to PV updates and retrieving
+    cached values from the monitoring subsystem.
+
+    Implementations:
+    - PVMonitorManager: ophyd-based EPICS implementation
+    - MockPVMonitor: returns mock data for testing
+    """
+
+    def subscribe(
+        self,
+        pv_name: str,
+        callback: Optional[Callable[[PVUpdate], None]] = None,
+        read_only: bool = False,
+    ) -> None:
+        """
+        Subscribe to PV updates.
+
+        Raises:
+            PVNotFoundError: If PV cannot be connected.
+        """
+        ...
+
+    def unsubscribe(
+        self, pv_name: str, callback: Optional[Callable] = None
+    ) -> None:
+        """Unsubscribe from PV updates (callback=None removes all)."""
+        ...
+
+    def get_value(self, pv_name: str) -> Optional[PVValue]:
+        """Get current PV value, or None if not connected."""
+        ...
+
+    def get_buffer(self, pv_name: str) -> List[PVValue]:
+        """Get buffered PV values."""
+        ...
+
+    def is_connected(self, pv_name: str) -> bool:
+        """Check if PV is currently connected."""
+        ...
+
+    def get_connected_pvs(self) -> List[str]:
+        """List currently connected PV names."""
+        ...
+
+    async def cleanup(self) -> None:
+        """Cleanup all PV connections."""
+        ...
+
+
+class MockPVMonitor:
+    """
+    Mock PV monitor for testing. Returns mock values without EPICS connection.
+    """
+
+    def __init__(self):
+        self._subscribed: dict[str, bool] = {}
+        self._callbacks: dict[str, list] = {}
+        self._values: dict[str, PVValue] = {}
+
+    def subscribe(
+        self,
+        pv_name: str,
+        callback: Optional[Callable[[PVUpdate], None]] = None,
+        read_only: bool = False,
+    ) -> None:
+        self._subscribed[pv_name] = True
+        if callback:
+            self._callbacks.setdefault(pv_name, []).append(callback)
+        self._values[pv_name] = PVValue(
+            pv_name=pv_name,
+            value=0.0,
+            timestamp=datetime.now(),
+            status=0,
+            severity=0,
+            connected=True,
+        )
+
+    def unsubscribe(
+        self, pv_name: str, callback: Optional[Callable] = None
+    ) -> None:
+        if callback and pv_name in self._callbacks:
+            try:
+                self._callbacks[pv_name].remove(callback)
+            except ValueError:
+                pass
+        else:
+            self._subscribed.pop(pv_name, None)
+            self._callbacks.pop(pv_name, None)
+            self._values.pop(pv_name, None)
+
+    def get_value(self, pv_name: str) -> Optional[PVValue]:
+        return self._values.get(pv_name)
+
+    def get_buffer(self, pv_name: str) -> List[PVValue]:
+        value = self._values.get(pv_name)
+        return [value] if value else []
+
+    def is_connected(self, pv_name: str) -> bool:
+        return pv_name in self._subscribed
+
+    def get_connected_pvs(self) -> List[str]:
+        return list(self._subscribed.keys())
+
+    async def cleanup(self) -> None:
+        self._subscribed.clear()
+        self._callbacks.clear()
+        self._values.clear()
+
+    def set_mock_value(self, pv_name: str, value: Any) -> None:
+        """Trigger a mock update for testing callback propagation."""
+        if pv_name not in self._subscribed:
+            return
+        now = datetime.now()
+        self._values[pv_name] = PVValue(
+            pv_name=pv_name, value=value, timestamp=now, status=0,
+            severity=0, connected=True,
+        )
+        update = PVUpdate(
+            pv_name=pv_name, value=value, timestamp=now, status=0,
+            severity=0, connected=True,
+        )
+        for cb in self._callbacks.get(pv_name, []):
+            try:
+                cb(update)
+            except Exception:
+                pass

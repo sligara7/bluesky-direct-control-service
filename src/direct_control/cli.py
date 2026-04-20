@@ -12,7 +12,6 @@ Or with custom configuration:
 """
 
 import argparse
-import os
 import sys
 from typing import Optional
 
@@ -38,7 +37,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         Exit code (0 for success, non-zero for errors)
     """
     parser = argparse.ArgumentParser(
-        description="Bluesky Direct Device Control Service (SVC-003)",
+        description=(
+            "Bluesky Direct Device Control + Monitoring Service (SVC-003): "
+            "A4-coordinated commanding plus real-time EPICS PV streaming."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     
@@ -58,7 +60,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--workers",
         type=int,
         default=1,
-        help="Number of worker processes"
+        help="Number of worker processes (use 1 for WebSocket support)"
     )
     parser.add_argument(
         "--reload",
@@ -97,7 +99,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     # Display startup information
-    print("Starting Direct Device Control Service (SVC-003)")
+    print("Starting Direct Device Control + Monitoring Service (SVC-003)")
     print(f"  Host: {args.host}")
     print(f"  Port: {args.port}")
     print(f"  Workers: {args.workers}")

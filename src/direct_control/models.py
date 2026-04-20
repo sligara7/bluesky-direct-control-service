@@ -1,12 +1,15 @@
 """
-Pydantic models for Direct Device Control Service.
+Pydantic models for Direct Device Control + Monitoring Service.
 """
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Optional, Dict, List
-from pydantic import BaseModel, Field, ConfigDict
+from typing import Any, Dict, List, Optional
 
+from pydantic import BaseModel, ConfigDict, Field
+
+
+# ===== Device Control Enums =====
 
 class DeviceLockStatus(str, Enum):
     """Status of a device lock."""
@@ -17,145 +20,17 @@ class DeviceLockStatus(str, Enum):
 
 class CommandMode(str, Enum):
     """Command execution mode for PV writes."""
-    PUT_COMPLETION = "put-completion"  # High fidelity: wait for confirmation
-    FIRE_AND_FORGET = "fire-and-forget"  # Low fidelity: issue write, don't wait
+    PUT_COMPLETION = "put-completion"
+    FIRE_AND_FORGET = "fire-and-forget"
 
 
-class PVSetRequest(BaseModel):
-    """
-    Request to set a PV value (Low Fidelity Channel).
+class SubscriptionStatus(str, Enum):
+    """Status of a PV subscription."""
+    ACTIVE = "active"
+    PAUSED = "paused"
+    ERROR = "error"
+    DISCONNECTED = "disconnected"
 
-    Two modes available:
-    - wait=True (put-completion): Waits for write confirmation, returns result via F-012
-    - wait=False (fire-and-forget): Issues write immediately, ideal for motor jogging
-      where client monitors PV readback updates instead of waiting for completion
-    """
-    model_config = ConfigDict(extra="forbid")
-
-    pv_name: str = Field(..., description="EPICS PV name")
-    value: Any = Field(..., description="Value to set")
-    wait: bool = Field(
-        False,  # Default to fire-and-forget for low-fidelity channel
-        description="Wait for put completion. False=fire-and-forget (monitor PV updates), True=wait for confirmation"
-    )
-    timeout: Optional[float] = Field(None, description="Timeout in seconds (only used when wait=True)", ge=0.0)
-
-
-class PVSetResponse(BaseModel):
-    """
-    Response from PV set operation (Low Fidelity Channel).
-
-    The `mode` field indicates which channel was used:
-    - "put-completion": Write confirmed, `success` reflects actual result
-    - "fire-and-forget": Write issued, `success` indicates write was sent (not confirmed)
-    """
-    model_config = ConfigDict(extra="forbid")
-
-    pv_name: str = Field(..., description="EPICS PV name")
-    success: bool = Field(..., description="Whether set operation succeeded (or was issued for fire-and-forget)")
-    value_set: Any = Field(..., description="Value that was set")
-    timestamp: datetime = Field(..., description="Timestamp of operation")
-    coordination_checked: bool = Field(..., description="Whether coordination was checked")
-    mode: CommandMode = Field(..., description="Execution mode: put-completion or fire-and-forget")
-    message: Optional[str] = Field(None, description="Status message or error")
-
-
-class DeviceCommandRequest(BaseModel):
-    """
-    Request to execute a device method (High Fidelity Channel).
-
-    This is the high-fidelity channel that always returns a result.
-
-    Use when:
-    - Confirmation of operation completion is required
-    - Invoking Ophyd device methods (set, move, trigger, etc.)
-
-    The `use_put` option (as-ophyd-api compatible):
-    - use_put=False (default): Uses ophyd's set() method which returns a Status
-      object and waits for the operation to complete (e.g., motor done moving)
-    - use_put=True: Uses ophyd's put() method which writes the value and returns
-      immediately without waiting for completion. Faster for rapid adjustments.
-    """
-    model_config = ConfigDict(extra="forbid")
-
-    device_name: str = Field(..., description="Ophyd device name")
-    method: str = Field(..., description="Method to execute (set, read, trigger, etc.)")
-    args: List[Any] = Field(default_factory=list, description="Positional arguments")
-    kwargs: Dict[str, Any] = Field(default_factory=dict, description="Keyword arguments")
-    timeout: Optional[float] = Field(None, description="Timeout in seconds", ge=0.0)
-    use_put: bool = Field(
-        False,
-        description="Use put() instead of set(). put() returns immediately without "
-                    "waiting for completion (e.g., motor done moving). Useful for "
-                    "rapid jogging where you don't need confirmation."
-    )
-
-
-class DeviceCommandResponse(BaseModel):
-    """
-    Response from device command execution (High Fidelity Channel).
-
-    This response indicates the result of the operation. When use_put=True,
-    the response returns immediately after issuing the command. When
-    use_put=False (default), the response waits for operation completion.
-    """
-    model_config = ConfigDict(extra="forbid")
-
-    device_name: str = Field(..., description="Ophyd device name")
-    method: str = Field(..., description="Method executed")
-    success: bool = Field(..., description="Whether command succeeded")
-    result: Any = Field(None, description="Command result")
-    timestamp: datetime = Field(..., description="Timestamp of operation")
-    coordination_checked: bool = Field(..., description="Whether coordination was checked")
-    message: Optional[str] = Field(None, description="Status message or error")
-    use_put: bool = Field(
-        False,
-        description="Whether put() was used instead of set(). "
-                    "True means command returned without waiting for completion."
-    )
-
-
-class CoordinationStatus(BaseModel):
-    """Coordination status from Experiment Execution Service."""
-    model_config = ConfigDict(extra="forbid")
-    
-    device_available: bool = Field(..., description="Whether device is available")
-    locked_by: Optional[str] = Field(None, description="Plan ID holding the lock")
-    status: DeviceLockStatus = Field(..., description="Lock status")
-    timestamp: datetime = Field(..., description="Status timestamp")
-
-
-class ControlError(Exception):
-    """Base exception for control errors."""
-    pass
-
-
-class DeviceLockedError(ControlError):
-    """Raised when device is locked by active plan."""
-    pass
-
-
-class CoordinationCheckError(ControlError):
-    """Raised when coordination check fails."""
-    pass
-
-
-class AuthorizationError(ControlError):
-    """Raised when user is not authorized to command device."""
-    pass
-
-
-class HealthResponse(BaseModel):
-    """Health check response."""
-    model_config = ConfigDict(extra="forbid")
-
-    status: str = Field("healthy", description="Service health status")
-    timestamp: datetime = Field(..., description="Health check timestamp")
-    coordination_service_available: bool = Field(..., description="Coordination service reachable")
-    auth_service_available: bool = Field(..., description="Auth service reachable")
-
-
-# ===== PV Metadata Models (as-ophyd-api / ophyd-websocket compatible) =====
 
 class AlarmSeverity(str, Enum):
     """EPICS alarm severity levels."""
@@ -165,148 +40,375 @@ class AlarmSeverity(str, Enum):
     INVALID = "INVALID"
 
 
-class PVInfo(BaseModel):
-    """
-    Detailed PV information including metadata (as-ophyd-api compatible).
+ALARM_SEVERITY_NAMES = {
+    0: "NO_ALARM",
+    1: "MINOR",
+    2: "MAJOR",
+    3: "INVALID",
+}
 
-    Equivalent to as-ophyd-api's describe endpoint and ophyd-websocket's
-    meta subscription event.
+
+# ===== Device Control Request/Response =====
+
+class PVSetRequest(BaseModel):
+    """
+    Request to set a PV value (Low Fidelity Channel).
+
+    Two modes available:
+    - wait=True (put-completion): Waits for write confirmation.
+    - wait=False (fire-and-forget): Issues write immediately, client monitors
+      PV readback for feedback.
     """
     model_config = ConfigDict(extra="forbid")
 
     pv_name: str = Field(..., description="EPICS PV name")
-    value: Any = Field(None, description="Current value")
-    connected: bool = Field(..., description="Whether PV is connected")
-    read_access: bool = Field(True, description="Whether read access is available")
-    write_access: bool = Field(True, description="Whether write access is available")
-    timestamp: datetime = Field(..., description="Timestamp of last update")
+    value: Any = Field(..., description="Value to set")
+    wait: bool = Field(False, description="Wait for put completion")
+    timeout: Optional[float] = Field(None, description="Timeout (only used when wait=True)", ge=0.0)
 
-    # Limits (from as-ophyd-api)
-    lower_ctrl_limit: Optional[float] = Field(None, description="Lower control limit")
-    upper_ctrl_limit: Optional[float] = Field(None, description="Upper control limit")
-    lower_disp_limit: Optional[float] = Field(None, description="Lower display limit")
-    upper_disp_limit: Optional[float] = Field(None, description="Upper display limit")
 
-    # Metadata (from ophyd-websocket)
-    units: Optional[str] = Field(None, description="Engineering units")
-    precision: Optional[int] = Field(None, description="Display precision")
-    enum_strs: Optional[List[str]] = Field(None, description="Enum string values")
+class PVSetResponse(BaseModel):
+    """Response from PV set operation."""
+    model_config = ConfigDict(extra="forbid")
 
-    # Alarm status (from as-ophyd-api)
-    alarm_status: Optional[str] = Field(None, description="Alarm status")
-    alarm_severity: Optional[AlarmSeverity] = Field(None, description="Alarm severity")
+    pv_name: str
+    success: bool
+    value_set: Any
+    timestamp: datetime
+    coordination_checked: bool
+    mode: CommandMode
+    message: Optional[str] = None
+
+
+class DeviceCommandRequest(BaseModel):
+    """
+    Request to execute a device method (High Fidelity Channel).
+
+    use_put=False (default): ophyd set() waits for completion.
+    use_put=True: ophyd put() returns immediately.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    device_name: str
+    method: str
+    args: List[Any] = Field(default_factory=list)
+    kwargs: Dict[str, Any] = Field(default_factory=dict)
+    timeout: Optional[float] = Field(None, ge=0.0)
+    use_put: bool = False
+
+
+class DeviceCommandResponse(BaseModel):
+    """Response from device command execution."""
+    model_config = ConfigDict(extra="forbid")
+
+    device_name: str
+    method: str
+    success: bool
+    result: Any = None
+    timestamp: datetime
+    coordination_checked: bool
+    message: Optional[str] = None
+    use_put: bool = False
+
+
+class CoordinationStatus(BaseModel):
+    """Coordination status from Experiment Execution Service."""
+    model_config = ConfigDict(extra="forbid")
+
+    device_available: bool
+    locked_by: Optional[str] = None
+    status: DeviceLockStatus
+    timestamp: datetime
+
+
+# ===== PV Metadata / Value Models =====
+
+class PVValue(BaseModel):
+    """
+    Current value of a PV (as-ophyd-api compatible).
+
+    Returned by PVMonitor.get_value(). Includes EPICS metadata for richer
+    client display (units, precision, limits, alarm status).
+    """
+    model_config = ConfigDict(extra="allow")
+
+    pv_name: str
+    value: Any
+    timestamp: datetime
+    status: int = 0
+    severity: int = 0
+    connected: bool = True
+
+    units: Optional[str] = None
+    precision: Optional[int] = None
+    enum_strs: Optional[List[str]] = None
+
+    lower_ctrl_limit: Optional[float] = None
+    upper_ctrl_limit: Optional[float] = None
+    lower_disp_limit: Optional[float] = None
+    upper_disp_limit: Optional[float] = None
+
+    read_access: bool = True
+    write_access: bool = True
+
+
+class PVUpdate(BaseModel):
+    """PV update notification sent via WebSocket (ophyd-websocket compatible)."""
+    model_config = ConfigDict(extra="forbid")
+
+    event_type: str = "pv_update"
+    pv_name: str
+    value: Any
+    timestamp: datetime
+    status: int = 0
+    severity: int = 0
+    connected: bool = True
+    read_access: bool = True
+    write_access: bool = False
+    alarm_status: Optional[str] = None
+    alarm_severity: Optional[int] = None
+    alarm_severity_name: Optional[str] = None
+    lower_ctrl_limit: Optional[float] = None
+    upper_ctrl_limit: Optional[float] = None
+    lower_disp_limit: Optional[float] = None
+    upper_disp_limit: Optional[float] = None
+    units: Optional[str] = None
+    precision: Optional[int] = None
+
+
+class PVInfo(BaseModel):
+    """Detailed PV information including metadata."""
+    model_config = ConfigDict(extra="forbid")
+
+    pv_name: str
+    value: Any = None
+    connected: bool
+    read_access: bool = True
+    write_access: bool = True
+    timestamp: datetime
+
+    lower_ctrl_limit: Optional[float] = None
+    upper_ctrl_limit: Optional[float] = None
+    lower_disp_limit: Optional[float] = None
+    upper_disp_limit: Optional[float] = None
+
+    units: Optional[str] = None
+    precision: Optional[int] = None
+    enum_strs: Optional[List[str]] = None
+
+    alarm_status: Optional[str] = None
+    alarm_severity: Optional[AlarmSeverity] = None
 
 
 class PVValueResponse(BaseModel):
-    """
-    PV value response with connection and access info (ophyd-websocket compatible).
-
-    This extended response includes connection status and access permissions,
-    matching the ophyd-websocket value update format.
-    """
+    """PV value response with connection and access info."""
     model_config = ConfigDict(extra="forbid")
 
-    pv_name: str = Field(..., description="EPICS PV name")
-    value: Any = Field(..., description="Current value")
-    timestamp: datetime = Field(..., description="Timestamp")
-    connected: bool = Field(True, description="Whether PV is connected")
-    read_access: bool = Field(True, description="Whether read access is available")
-    write_access: bool = Field(True, description="Whether write access is available")
+    pv_name: str
+    value: Any
+    timestamp: datetime
+    connected: bool = True
+    read_access: bool = True
+    write_access: bool = True
 
 
-class StopRequest(BaseModel):
-    """Request to stop a device/motor (as-ophyd-api compatible)."""
+class PVLimits(BaseModel):
+    """PV value limits for validation."""
     model_config = ConfigDict(extra="forbid")
 
-    timeout: Optional[float] = Field(None, description="Timeout in seconds")
+    pv_name: str
+    lower_limit: Optional[float] = None
+    upper_limit: Optional[float] = None
+    has_limits: bool = False
 
 
-class StopResponse(BaseModel):
-    """Response from stop operation."""
+# ===== Monitoring Subscription Models =====
+
+class PVMonitorRequest(BaseModel):
+    """Request to monitor one or more PVs."""
     model_config = ConfigDict(extra="forbid")
 
-    pv_name: str = Field(..., description="PV name that was stopped")
-    success: bool = Field(..., description="Whether stop succeeded")
-    timestamp: datetime = Field(..., description="Timestamp")
-    message: Optional[str] = Field(None, description="Status message")
+    pv_names: List[str]
+    update_rate: Optional[float] = Field(None, ge=0.0)
+    buffer_size: Optional[int] = Field(None, ge=1, le=1000)
+
+
+class PVSubscription(BaseModel):
+    """Information about an active PV subscription."""
+    model_config = ConfigDict(extra="forbid")
+
+    subscription_id: str
+    pv_names: List[str]
+    status: SubscriptionStatus
+    created_at: datetime
+    last_update: Optional[datetime] = None
+    update_count: int = 0
+    client_id: Optional[str] = None
 
 
 # ===== WebSocket Models (ophyd-websocket compatible) =====
 
 class WebSocketAction(str, Enum):
     """WebSocket control actions (ophyd-websocket compatible)."""
-    SET = "set"  # Set PV or device value
-    GET = "get"  # Get current value
-    PING = "ping"  # Keepalive ping
-    SUBSCRIBE = "subscribe"  # Subscribe to value updates
-    UNSUBSCRIBE = "unsubscribe"  # Unsubscribe from updates
-    SUBSCRIBE_SAFELY = "subscribeSafely"  # Subscribe, fail if not connected
-    SUBSCRIBE_READ_ONLY = "subscribeReadOnly"  # Subscribe with read-only access
-    REFRESH = "refresh"  # Refresh all subscriptions
-    STOP = "stop"  # Stop device movement
+    SET = "set"
+    GET = "get"
+    PING = "ping"
+    SUBSCRIBE = "subscribe"
+    UNSUBSCRIBE = "unsubscribe"
+    SUBSCRIBE_SAFELY = "subscribeSafely"
+    SUBSCRIBE_READ_ONLY = "subscribeReadOnly"
+    REFRESH = "refresh"
+    STOP = "stop"
+
+
+class WebSocketMessage(BaseModel):
+    """Incoming WebSocket message."""
+    model_config = ConfigDict(extra="allow")
+
+    action: WebSocketAction
+    pv: Optional[str] = None
+    pv_names: Optional[List[str]] = None
+    device: Optional[str] = None
+    component: Optional[str] = None
+    value: Optional[Any] = None
+    timeout: Optional[float] = None
 
 
 class WebSocketSetRequest(BaseModel):
-    """WebSocket set request (ophyd-websocket compatible)."""
+    """WebSocket set request."""
     model_config = ConfigDict(extra="forbid")
 
-    action: WebSocketAction = Field(..., description="Action to perform")
-    pv: Optional[str] = Field(None, description="PV name (for PV operations)")
-    device: Optional[str] = Field(None, description="Device name (for device operations)")
-    component: Optional[str] = Field(None, description="Nested component path (e.g., 'user_readback')")
-    value: Optional[Any] = Field(None, description="Value to set (for set action)")
-    timeout: Optional[float] = Field(None, description="Timeout in seconds")
+    action: WebSocketAction
+    pv: Optional[str] = None
+    device: Optional[str] = None
+    component: Optional[str] = None
+    value: Optional[Any] = None
+    timeout: Optional[float] = None
 
 
 class WebSocketSetResponse(BaseModel):
-    """WebSocket set response (ophyd-websocket compatible)."""
+    """WebSocket set response."""
     model_config = ConfigDict(extra="forbid")
 
-    type: str = Field(..., description="Response type")
-    pv: Optional[str] = Field(None, description="PV name")
-    device: Optional[str] = Field(None, description="Device name")
-    component: Optional[str] = Field(None, description="Nested component path")
-    value: Optional[Any] = Field(None, description="Value (current or set)")
-    success: bool = Field(..., description="Whether operation succeeded")
-    message: Optional[str] = Field(None, description="Status message or error")
-    timestamp: str = Field(..., description="ISO timestamp")
+    type: str
+    pv: Optional[str] = None
+    device: Optional[str] = None
+    component: Optional[str] = None
+    value: Optional[Any] = None
+    success: bool
+    message: Optional[str] = None
+    timestamp: str
 
 
 # ===== Nested Component Models =====
 
 class NestedDeviceRequest(BaseModel):
-    """Request to access nested device component (device_path comes from URL)."""
+    """Request to access nested device component."""
     model_config = ConfigDict(extra="forbid")
 
-    method: str = Field("read", description="Method to execute (read, set, trigger, etc.)")
-    value: Optional[Any] = Field(None, description="Value to set (for set method)")
-    timeout: Optional[float] = Field(None, description="Timeout in seconds")
+    method: str = "read"
+    value: Optional[Any] = None
+    timeout: Optional[float] = None
 
 
 class NestedDeviceResponse(BaseModel):
     """Response from nested device access."""
     model_config = ConfigDict(extra="forbid")
 
-    device_path: str = Field(..., description="Full device path")
-    method: str = Field(..., description="Method executed")
-    success: bool = Field(..., description="Whether operation succeeded")
-    result: Any = Field(None, description="Result value")
-    timestamp: datetime = Field(..., description="Timestamp")
-    message: Optional[str] = Field(None, description="Status message or error")
+    device_path: str
+    method: str
+    success: bool
+    result: Any = None
+    timestamp: datetime
+    message: Optional[str] = None
 
 
-# ===== Value Limit Validation =====
+# ===== Device-Socket Models =====
 
-class PVLimits(BaseModel):
-    """PV value limits for validation."""
+class DeviceUpdate(BaseModel):
+    """Device value update notification (ophyd-websocket compatible)."""
     model_config = ConfigDict(extra="forbid")
 
-    pv_name: str = Field(..., description="PV name")
-    lower_limit: Optional[float] = Field(None, description="Lower control limit")
-    upper_limit: Optional[float] = Field(None, description="Upper control limit")
-    has_limits: bool = Field(False, description="Whether limits are defined")
+    event_type: str = "device_update"
+    device: str
+    signal: Optional[str] = None
+    value: Any
+    timestamp: datetime
+    connected: bool = True
+    read_access: Optional[bool] = True
+    write_access: Optional[bool] = None
+
+
+class DeviceInfo(BaseModel):
+    """Device information from configuration service."""
+    model_config = ConfigDict(extra="allow")
+
+    name: str
+    device_type: str
+    ophyd_class: Optional[str] = None
+    pvs: Dict[str, str] = Field(default_factory=dict)
+    is_movable: bool = False
+    is_readable: bool = True
+
+
+# ===== Stop Operation Models =====
+
+class StopRequest(BaseModel):
+    """Request to stop a device/motor."""
+    model_config = ConfigDict(extra="forbid")
+
+    timeout: Optional[float] = None
+
+
+class StopResponse(BaseModel):
+    """Response from stop operation."""
+    model_config = ConfigDict(extra="forbid")
+
+    pv_name: str
+    success: bool
+    timestamp: datetime
+    message: Optional[str] = None
+
+
+# ===== Health Response =====
+
+class HealthResponse(BaseModel):
+    """Health check response for the merged service."""
+    model_config = ConfigDict(extra="forbid")
+
+    status: str = "healthy"
+    timestamp: datetime
+    coordination_service_available: bool
+    active_subscriptions: int = 0
+    connected_pvs: int = 0
+    websocket_connections: int = 0
+
+
+# ===== Exceptions =====
+
+class ControlError(Exception):
+    """Base exception for control errors."""
+
+
+class DeviceLockedError(ControlError):
+    """Raised when device is locked by active plan."""
+
+
+class CoordinationCheckError(ControlError):
+    """Raised when coordination check fails."""
 
 
 class ValueLimitError(ControlError):
     """Raised when value is outside PV limits."""
-    pass
+
+
+class MonitoringError(Exception):
+    """Base exception for monitoring errors."""
+
+
+class PVNotFoundError(MonitoringError):
+    """Raised when a requested PV cannot be found."""
+
+
+class SubscriptionError(MonitoringError):
+    """Raised when subscription management fails."""

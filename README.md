@@ -1,43 +1,43 @@
-# Direct Device Control Service (SVC-003)
+# Direct Device Control + Monitoring Service (SVC-003)
 
-Device commanding with A4 coordination checks for Bluesky Remote Architecture.
+Combined service: A4-coordinated device commanding **and** real-time EPICS PV
+monitoring via WebSocket, running on a single port.
 
 ## Features
 
-- **A4 Device Coordination**: Checks with experiment_execution before commanding (returns 423 if locked)
-- **PV Control**: Low-fidelity channel for EPICS PV set/get (fire-and-forget or put-completion)
-- **Device Method Execution**: High-fidelity channel for Ophyd device methods
-- **Nested Device Access**: Navigate device component hierarchies (ophyd-websocket compatible)
-- **WebSocket Control**: Real-time device control protocol
-- **Authorization**: RBAC integration with auth_service
+- **A4 Device Coordination**: Checks with experiment_execution before any write; returns `423 Locked` if a plan holds the device.
+- **PV Control**: Low-fidelity channel for EPICS PV set/get (fire-and-forget or put-completion).
+- **Device Method Execution**: High-fidelity channel for Ophyd device methods, always confirmed.
+- **Nested Device Access**: Navigate device component hierarchies (ophyd-websocket compatible).
+- **EPICS PV Monitoring**: Channel Access + PVAccess subscriptions via ophyd (pyepics, p4p).
+- **WebSocket Streaming**: Real-time PV and device updates; writes route through coordination.
+- **ophyd-websocket compatible**: `pv-socket`, `device-socket`, `control-socket` endpoints.
+- **No in-service auth**: Authorization is handled by upstream middleware.
 
 ## Deployment
 
 ### Installation
 
 ```bash
-# From the service directory
 pip install -e .
-
-# Or from the monorepo
-pip install -e archive/services/direct_control/
 ```
 
 ### Running the Service
 
 ```bash
-# Basic startup
+# Basic startup (port 8003)
 bluesky-direct-control
 
 # With custom experiment_execution URL
-bluesky-direct-control --port 8003
 export DIRECT_CONTROL_EXPERIMENT_EXECUTION_URL=http://localhost:8001
+bluesky-direct-control
 
-# Disable coordination checks (testing)
+# With EPICS configuration
+export EPICS_CA_ADDR_LIST="10.0.0.255"
+bluesky-direct-control
+
+# Disable coordination checks (testing only)
 DIRECT_CONTROL_COORDINATION_CHECK_ENABLED=false bluesky-direct-control
-
-# Disable auth requirement (testing)
-DIRECT_CONTROL_REQUIRE_AUTH=false bluesky-direct-control
 
 # Development mode with auto-reload
 bluesky-direct-control --reload --log-level debug
@@ -57,8 +57,7 @@ docker run -p 8003:8003 \
 | Dependency | Interface | Purpose |
 |------------|-----------|---------|
 | `experiment_execution` | `/api/v1/coordination/devices/{name}/status` | A4 device lock status |
-| `configuration_service` | `/api/v1/devices/{name}` | Device metadata |
-| `auth_service` | `/api/v1/auth/validate` | Token validation |
+| `configuration_service` | `/api/v1/devices/{name}`, `/api/v1/pvs` | Device + PV registry |
 
 ## Configuration
 
@@ -71,28 +70,23 @@ All settings use the `DIRECT_CONTROL_` environment variable prefix.
 | `DIRECT_CONTROL_LOG_LEVEL` | `info` | Log level |
 | `DIRECT_CONTROL_EXPERIMENT_EXECUTION_URL` | `http://localhost:8001` | Experiment Execution URL |
 | `DIRECT_CONTROL_CONFIGURATION_SERVICE_URL` | `http://localhost:8004` | Configuration Service URL |
-| `DIRECT_CONTROL_AUTH_SERVICE_URL` | `http://localhost:8010` | Auth Service URL |
 | `DIRECT_CONTROL_COORDINATION_CHECK_ENABLED` | `true` | Enable A4 coordination checks |
-| `DIRECT_CONTROL_COORDINATION_TIMEOUT` | `5.0` | Coordination check timeout (seconds) |
-| `DIRECT_CONTROL_REQUIRE_AUTH` | `true` | Require authorization token |
-| `DIRECT_CONTROL_ALLOWED_ROLES` | `["staff", "scientist"]` | Roles allowed to command |
-| `DIRECT_CONTROL_COMMAND_TIMEOUT` | `30.0` | Command execution timeout (seconds) |
+| `DIRECT_CONTROL_COORDINATION_TIMEOUT` | `5.0` | Coordination check timeout (s) |
+| `DIRECT_CONTROL_COMMAND_TIMEOUT` | `30.0` | Command execution timeout (s) |
+| `DIRECT_CONTROL_WS_MAX_CONNECTIONS` | `100` | Max WebSocket connections |
+| `DIRECT_CONTROL_WS_HEARTBEAT_INTERVAL` | `30` | Heartbeat interval (s) |
+| `DIRECT_CONTROL_WS_MESSAGE_QUEUE_SIZE` | `1000` | Message queue size |
+| `DIRECT_CONTROL_PV_BUFFER_SIZE` | `100` | PV value buffer size |
+| `DIRECT_CONTROL_PV_UPDATE_RATE_LIMIT` | `0.1` | Min seconds between updates |
 | `DIRECT_CONTROL_ENABLE_METRICS` | `true` | Enable Prometheus metrics |
 | `DIRECT_CONTROL_METRICS_PORT` | `9003` | Metrics port |
-| `EPICS_CA_ADDR_LIST` | - | EPICS Channel Access address list |
+| `EPICS_CA_ADDR_LIST` | — | EPICS Channel Access address list |
 | `EPICS_CA_AUTO_ADDR_LIST` | `YES` | Auto-discover EPICS addresses |
 
 ### CLI Options
 
 ```
 bluesky-direct-control --help
-
-Options:
-  --host TEXT                     Host to bind to (default: 0.0.0.0)
-  --port INTEGER                  Port to bind to (default: 8003)
-  --reload                        Enable auto-reload for development
-  --workers INTEGER               Number of worker processes
-  --log-level [critical|error|warning|info|debug|trace]
 ```
 
 ## API Endpoints
@@ -100,19 +94,33 @@ Options:
 ### Health & Status
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/health` | Health check (includes coordination status) |
-| GET | `/api/v1/stats` | Service statistics |
+| GET | `/health` | Health check (coordination + monitoring stats) |
+| GET | `/api/v1/stats` | Combined control + monitoring statistics |
 
-### PV Control (Low Fidelity)
+### PV Control (Low Fidelity, coordination-checked)
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/api/v1/pv/set` | Set PV value (coordination check) |
-| GET | `/api/v1/pv/{pv_name}/value` | Get PV value (read-only, no coordination) |
+| POST | `/api/v1/pv/set` | Set PV value |
+| GET | `/api/v1/pv/{pv_name}/value` | One-shot CA get (read-only) |
 
-### Device Control (High Fidelity)
+### PV Monitoring (subscription-backed)
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/v1/pvs/{pv_name}/value` | Current value from subscription cache (full metadata) |
+| GET | `/api/v1/pvs/connected` | List currently connected PVs |
+
+### Device Control (High Fidelity, coordination-checked)
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | POST | `/api/v1/device/execute` | Execute Ophyd device method |
+| POST | `/api/v1/device/{device_name}/stop` | Stop a device |
+
+### Device Metadata (proxied from configuration_service)
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/v1/devices` | List devices (with class / protocol filters) |
+| GET | `/api/v1/devices/{device_name}` | Get device metadata |
+| GET | `/api/v1/devices/{device_name}/bundle` | Hierarchical component tree |
 
 ### Nested Device Access (ophyd-websocket compatible)
 | Method | Endpoint | Description |
@@ -120,10 +128,16 @@ Options:
 | POST | `/api/v1/device/{device_path}` | Access nested component (read/set) |
 | GET | `/api/v1/device/{device_path}/value` | Get nested component value |
 
-### WebSocket Control
+### WebSockets
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| WS | `/api/v1/control-socket` | Real-time device control |
+| WS | `/ws/pv/monitor` | PV monitoring (legacy path) |
+| WS | `/api/v1/pv-socket` | PV monitoring (ophyd-websocket compatible) |
+| WS | `/api/v1/device-socket` | Device-level monitoring (ophyd-websocket compatible) |
+| WS | `/api/v1/control-socket` | Combined PV + device control |
+
+All write actions over WebSocket (`set`, `stop`) route through `DeviceControl`
+and inherit the A4 coordination check.
 
 ## Example curl Commands
 
@@ -136,7 +150,6 @@ curl http://localhost:8003/health
 ```bash
 curl -X POST http://localhost:8003/api/v1/pv/set \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <token>" \
   -d '{"pv_name": "IOC:motor1", "value": 10.0, "wait": false}'
 ```
 
@@ -144,28 +157,35 @@ curl -X POST http://localhost:8003/api/v1/pv/set \
 ```bash
 curl -X POST http://localhost:8003/api/v1/pv/set \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <token>" \
   -d '{"pv_name": "IOC:motor1", "value": 10.0, "wait": true, "timeout": 5.0}'
 ```
 
-### Get PV Value (Read-Only)
+### Get PV Value (subscription-backed, with metadata)
 ```bash
-curl http://localhost:8003/api/v1/pv/IOC:motor1/value
+curl http://localhost:8003/api/v1/pvs/IOC:motor1/value
+```
+
+### List Connected PVs
+```bash
+curl http://localhost:8003/api/v1/pvs/connected
 ```
 
 ### Execute Device Method
 ```bash
 curl -X POST http://localhost:8003/api/v1/device/execute \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <token>" \
   -d '{"device_name": "det", "method": "trigger", "args": [], "kwargs": {}}'
+```
+
+### Stop a Device
+```bash
+curl -X POST http://localhost:8003/api/v1/device/motor1/stop
 ```
 
 ### Access Nested Device Component (Read)
 ```bash
 curl -X POST http://localhost:8003/api/v1/device/motor.user_readback \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <token>" \
   -d '{"method": "read"}'
 ```
 
@@ -173,93 +193,97 @@ curl -X POST http://localhost:8003/api/v1/device/motor.user_readback \
 ```bash
 curl -X POST http://localhost:8003/api/v1/device/motor.user_setpoint \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <token>" \
   -d '{"method": "set", "value": 5.0}'
 ```
 
-### Get Nested Device Value (Read-Only)
-```bash
-curl http://localhost:8003/api/v1/device/motor.user_readback/value
-```
+## WebSocket Protocols
 
-### Get Statistics
-```bash
-curl http://localhost:8003/api/v1/stats
-```
+### PV Monitoring (`/api/v1/pv-socket`, ophyd-websocket compatible)
 
-## WebSocket Protocol
-
-Connect to `/api/v1/control-socket` for real-time device control:
-
-```python
-import asyncio
-import websockets
-import json
-
-async def control_device():
-    uri = "ws://localhost:8003/api/v1/control-socket"
-    async with websockets.connect(uri) as ws:
-        # Set PV value
-        await ws.send(json.dumps({
-            "action": "set",
-            "pv": "IOC:motor1",
-            "value": 10.0
-        }))
-        response = await ws.recv()
-        print(json.loads(response))
-
-        # Set device component
-        await ws.send(json.dumps({
-            "action": "set",
-            "device": "motor",
-            "component": "user_setpoint",
-            "value": 5.0
-        }))
-        response = await ws.recv()
-        print(json.loads(response))
-
-        # Get PV value
-        await ws.send(json.dumps({
-            "action": "get",
-            "pv": "IOC:motor1"
-        }))
-        response = await ws.recv()
-        print(json.loads(response))
-
-asyncio.run(control_device())
-```
-
-### WebSocket Messages
-
-**Client to Server:**
+**Client → Server:**
 ```json
-{"action": "set", "pv": "IOC:m1", "value": 10}
-{"action": "set", "device": "motor1", "component": "user_setpoint", "value": 10}
-{"action": "get", "pv": "IOC:m1"}
-{"action": "get", "device": "motor1", "component": "user_readback"}
+{"action": "subscribe", "pv": "IOC:m1"}
+{"action": "unsubscribe", "pv": "IOC:m1"}
+{"action": "subscribeSafely", "pv": "IOC:m1"}
+{"action": "subscribeReadOnly", "pv": "IOC:m1"}
+{"action": "refresh", "pv": "IOC:m1"}
+{"action": "set", "pv": "IOC:m1", "value": 10, "timeout": 5}
+{"action": "stop", "device": "motor1"}
 {"action": "ping"}
 ```
 
-**Server to Client:**
+**Server → Client:**
 ```json
-{"type": "set_complete", "pv": "...", "success": true, "value": 10}
-{"type": "value", "pv": "...", "value": 10.5, "timestamp": "..."}
-{"type": "pong", "timestamp": "..."}
+{"type": "subscribed", "pv_names": ["IOC:m1"], "timestamp": "..."}
+{"type": "set_complete", "pv": "IOC:m1", "success": true, "value": 10}
 {"type": "error", "message": "Device locked by plan count", "locked": true}
+{"event_type": "pv_update", "pv_name": "IOC:m1", "value": 10.5, "connected": true, ...}
+```
+
+### Device-Level Monitoring (`/api/v1/device-socket`)
+
+Subscribes to all PVs of a device from configuration_service. Emits
+`device_update` events. See the device_monitoring docs in the original service
+for the full shape.
+
+### Combined Control (`/api/v1/control-socket`)
+
+Same protocol as `pv-socket`. Use when the client wants one socket for both
+monitoring and commanding; all writes are coordination-checked.
+
+### Python Client Example (PV monitoring)
+
+```python
+import asyncio
+import json
+import websockets
+
+async def monitor():
+    uri = "ws://localhost:8003/api/v1/pv-socket"
+    async with websockets.connect(uri) as ws:
+        await ws.send(json.dumps({"action": "subscribe", "pv": "IOC:motor1"}))
+        async for message in ws:
+            data = json.loads(message)
+            if data.get("event_type") == "pv_update":
+                print(f"{data['pv_name']}: {data['value']}")
+
+asyncio.run(monitor())
 ```
 
 ## A4 Coordination
 
-The service implements the **A4 coordination requirement**:
-
-1. Before any write operation, check with `experiment_execution` if the device is locked
-2. If device is locked by a running plan, return `HTTP 423 Locked`
-3. If coordination service unavailable, return `HTTP 503 Service Unavailable`
+Every write operation flows through the same check:
 
 ```
-User Request → Authorization Check → Coordination Check → EPICS Command
-                                           ↓
-                                   Device locked?
-                                   Yes → 423 Locked
-                                   No  → Execute
+Request → Registry validate → Coordination check → EPICS write
+                                    ↓
+                            Device locked?
+                            Yes → 423 Locked
+                            No  → Execute
 ```
+
+If the coordination service is unreachable: `503 Service Unavailable`.
+If the PV/device is not registered in configuration_service: `404 Not Found`.
+
+## Architecture
+
+```
+src/direct_control/
+├── main.py                 # FastAPI app, all endpoints, lifespan
+├── config.py               # Settings (DIRECT_CONTROL_ env prefix)
+├── models.py               # Pydantic models (control + monitoring)
+├── protocols.py            # CoordinationService, DeviceControl, PVMonitor
+├── cli.py                  # bluesky-direct-control entry point
+├── coordination_client.py  # A4 HTTP client
+├── device_controller.py    # EPICS/ophyd command execution
+├── registry_client.py      # Config-service validation with TTL cache
+└── monitoring/             # Monitoring subpackage (lazy-imported)
+    ├── pv_monitor.py              # ophyd EpicsSignal subscription manager
+    ├── websocket_manager.py       # /api/v1/pv-socket + legacy + control-socket
+    ├── device_websocket_manager.py # /api/v1/device-socket
+    └── describers.py              # ophyd device describer plugins
+```
+
+Writes through WebSocket are never direct EPICS writes — they always go
+through `DeviceControl.set_pv` / `.execute_device_method` / `.access_nested_device`,
+which perform the coordination check.
