@@ -10,7 +10,7 @@ Implements: PVMonitor protocol
 import os
 from collections import defaultdict, deque
 from datetime import datetime
-from typing import Callable, Deque, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional
 
 import numpy as np
 import structlog
@@ -119,6 +119,7 @@ class PVMonitorManager:
             if pv_name not in self._signals:
                 return
 
+            shape, dtype, ndim, nbytes = self._extract_array_metadata(value)
             converted_value = self._convert_value(value)
             ts = datetime.fromtimestamp(timestamp) if timestamp else datetime.now()
 
@@ -129,6 +130,10 @@ class PVMonitorManager:
                 status=0,
                 severity=0,
                 connected=True,
+                shape=shape,
+                dtype=dtype,
+                ndim=ndim,
+                nbytes=nbytes,
             )
             self._latest_values[pv_name] = pv_value
             self._buffers[pv_name].append(pv_value)
@@ -157,6 +162,16 @@ class PVMonitorManager:
             if not connected:
                 logger.warning("pv_disconnected", pv_name=pv_name)
 
+    @staticmethod
+    def _extract_array_metadata(raw: Any) -> tuple:
+        """Return (shape, dtype_str, ndim, nbytes) from the raw EPICS value."""
+        if isinstance(raw, np.ndarray):
+            return list(raw.shape), raw.dtype.str, int(raw.ndim), int(raw.nbytes)
+        if isinstance(raw, (np.number, np.bool_)):
+            arr = np.asarray(raw)
+            return [], arr.dtype.str, 0, int(arr.nbytes)
+        return [], None, 0, 0
+
     def _convert_value(self, value):
         if isinstance(value, np.ndarray):
             if value.dtype.kind in ["i", "u"]:
@@ -178,7 +193,9 @@ class PVMonitorManager:
         return value
 
     def _signal_to_pv_value(self, pv_name: str, signal: EpicsSignal) -> PVValue:
-        value = self._convert_value(signal.get())
+        raw = signal.get()
+        shape, dtype, ndim, nbytes = self._extract_array_metadata(raw)
+        value = self._convert_value(raw)
         timestamp = datetime.now()
         if signal.timestamp:
             try:
@@ -215,6 +232,10 @@ class PVMonitorManager:
             status=0,
             severity=0,
             connected=signal.connected,
+            shape=shape,
+            dtype=dtype,
+            ndim=ndim,
+            nbytes=nbytes,
             units=units,
             precision=precision,
             enum_strs=enum_strs,

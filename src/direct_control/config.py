@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     pv_buffer_size: int = 100
     pv_update_rate_limit: float = 0.1
 
+    # Maximum response bytesize for PV value endpoints (covers binary + JSON).
+    # Oversized arrays return 400 with a "slice or raise the limit" message.
+    response_bytesize_limit: int = 100_000_000  # 100 MB
+
     # Observability
     enable_metrics: bool = True
     metrics_port: int = 9003

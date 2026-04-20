@@ -78,6 +78,7 @@ All settings use the `DIRECT_CONTROL_` environment variable prefix.
 | `DIRECT_CONTROL_WS_MESSAGE_QUEUE_SIZE` | `1000` | Message queue size |
 | `DIRECT_CONTROL_PV_BUFFER_SIZE` | `100` | PV value buffer size |
 | `DIRECT_CONTROL_PV_UPDATE_RATE_LIMIT` | `0.1` | Min seconds between updates |
+| `DIRECT_CONTROL_RESPONSE_BYTESIZE_LIMIT` | `100000000` | Max bytesize for PV value responses (400 if exceeded) |
 | `DIRECT_CONTROL_ENABLE_METRICS` | `true` | Enable Prometheus metrics |
 | `DIRECT_CONTROL_METRICS_PORT` | `9003` | Metrics port |
 | `EPICS_CA_ADDR_LIST` | — | EPICS Channel Access address list |
@@ -124,6 +125,7 @@ Completion modes:
 
 | Param | Type | Default | Meaning |
 |---|---|---|---|
+| `format` | string \| null | — | Override `Accept` header: `json` or `binary` (octet-stream) |
 | `as_string` | bool | `false` | Return string representation (enum labels, char-waveform decoded) |
 | `count` | int \| null | native | Cap waveform elements returned |
 | `as_numpy` | bool | `true` | Return arrays as numpy (JSON-serialized to list either way) |
@@ -131,6 +133,38 @@ Completion modes:
 | `timeout` | float | `5.0` | CA get timeout (seconds) |
 | `connection_timeout` | float | `5.0` | CA connection timeout (seconds) |
 | `ftype` | int \| null | native | Force non-native DBR type via `ca.get(ftype=…)` (power-user) |
+
+**Response envelope** (tiled-style — applies to both `/api/v1/pv/{name}/value`
+and `/api/v1/pvs/{name}/value`):
+
+JSON mode (default, or `Accept: application/json`, or `?format=json`):
+```json
+{
+  "pv_name": "IOC:image",
+  "value": [[...], [...]],
+  "timestamp": "2026-04-20T12:00:00",
+  "shape": [1024, 1024],
+  "dtype": "<u2",
+  "ndim": 2,
+  "nbytes": 2097152
+}
+```
+For scalars: `shape=[]`, `dtype=null`, `ndim=0`, `nbytes=0`, `value` is a
+native JSON number/bool/string. The monitored endpoint additionally
+includes `connected`, `status`, `severity`, `units`, `precision`,
+`enum_strs`, `lower_ctrl_limit`, `upper_ctrl_limit`, `lower_disp_limit`,
+`upper_disp_limit`, `read_access`, `write_access`.
+
+Binary mode (`Accept: application/octet-stream` or `?format=binary`):
+- Body: raw bytes of a C-contiguous numpy array.
+- Headers: `X-PV-Name`, `X-PV-Shape` (csv), `X-PV-Dtype` (numpy
+  `dtype.str`, e.g. `<u2`), `X-PV-Ndim`, `X-PV-Nbytes`, `X-PV-Timestamp`.
+- Binary mode only serves numeric dtypes (int/uint/float/bool/complex).
+  Strings or enum-as-string return `406 Not Acceptable`.
+
+**Response size cap.** Any value whose `nbytes` exceeds
+`DIRECT_CONTROL_RESPONSE_BYTESIZE_LIMIT` (default 100 MB) returns
+`400 Bad Request` with a "slice or raise the limit" message.
 
 ### PV Monitoring (subscription-backed)
 | Method | Endpoint | Description |
@@ -203,6 +237,24 @@ curl "http://localhost:8003/api/v1/pv/IOC:valve1.VAL/value?as_string=true&connec
 
 # Waveform truncated to first 100 samples (default is a fresh CA get)
 curl "http://localhost:8003/api/v1/pv/IOC:wf1/value?count=100"
+```
+
+### Binary Retrieval of a 2D Image
+```bash
+# Raw bytes via Accept header; shape/dtype in X-PV-* response headers.
+curl -i -H "Accept: application/octet-stream" \
+  "http://localhost:8003/api/v1/pvs/IOC:camera1:image/value" \
+  -o image.bin
+
+# Or force via query param (handy when clients can't easily set Accept).
+curl "http://localhost:8003/api/v1/pv/IOC:camera1:image/value?format=binary" \
+  -o image.bin
+
+# Python reconstruction:
+#   import numpy as np
+#   shape = tuple(int(s) for s in resp.headers['X-PV-Shape'].split(','))
+#   dtype = np.dtype(resp.headers['X-PV-Dtype'])
+#   img = np.frombuffer(resp.content, dtype=dtype).reshape(shape)
 ```
 
 ### Get PV Value (subscription-backed, with metadata)

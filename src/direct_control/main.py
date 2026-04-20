@@ -16,8 +16,9 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 import structlog
-from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from .config import Settings
 from .coordination_client import CoordinationClient
@@ -153,6 +154,155 @@ def get_device_ws_manager():
     return app.state.device_ws_manager
 
 
+# ----- PV value response builder (tiled-style content negotiation) -----
+
+_JSON_MEDIA = "application/json"
+_BINARY_MEDIA = "application/octet-stream"
+_FORMAT_ALIASES = {
+    "json": _JSON_MEDIA,
+    "binary": _BINARY_MEDIA,
+    "octet-stream": _BINARY_MEDIA,
+}
+
+
+def _describe_value(value: Any) -> tuple:
+    """Return (shape, dtype_str, ndim, nbytes) for a pyepics/JSON value."""
+    import numpy as np
+
+    if value is None:
+        return [], None, 0, 0
+    if isinstance(value, np.ndarray):
+        return list(value.shape), value.dtype.str, int(value.ndim), int(value.nbytes)
+    if isinstance(value, (np.number, np.bool_)):
+        arr = np.asarray(value)
+        return [], arr.dtype.str, 0, int(arr.nbytes)
+    return [], None, 0, 0
+
+
+def _coerce_json_value(value: Any) -> Any:
+    """numpy arrays/scalars -> JSON-native; leave everything else untouched."""
+    if value is None:
+        return None
+    tolist = getattr(value, "tolist", None)
+    return tolist() if callable(tolist) else value
+
+
+def _negotiate_format(request: Request, format_param: Optional[str]) -> str:
+    """Pick a supported media type from ?format= or the Accept header."""
+    if format_param:
+        resolved = _FORMAT_ALIASES.get(format_param.lower(), format_param)
+        if resolved not in (_JSON_MEDIA, _BINARY_MEDIA):
+            raise HTTPException(
+                status_code=406,
+                detail=f"Unsupported format: {format_param}. Supported: json, binary.",
+            )
+        return resolved
+
+    accept = request.headers.get("accept", _JSON_MEDIA)
+    for chunk in accept.split(","):
+        media = chunk.split(";")[0].strip()
+        if media == "*/*":
+            return _JSON_MEDIA
+        if media in (_JSON_MEDIA, _BINARY_MEDIA):
+            return media
+    return _JSON_MEDIA
+
+
+def _build_value_response(
+    request: Request,
+    *,
+    pv_name: str,
+    value: Any,
+    timestamp_iso: str,
+    size_limit: int,
+    format_param: Optional[str],
+    # Pre-computed metadata overrides (used when value was already converted
+    # to JSON-native form and shape/dtype/ndim/nbytes are known from capture).
+    shape: Optional[List[int]] = None,
+    dtype: Optional[str] = None,
+    ndim: Optional[int] = None,
+    nbytes: Optional[int] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Response:
+    """
+    Build a tiled-style PV value response.
+
+    JSON mode returns `{pv_name, value, timestamp, shape, dtype, ndim, nbytes, **extra}`.
+    Binary mode returns raw bytes; shape/dtype live in `X-PV-*` headers so
+    clients can reshape.
+    """
+    import numpy as np
+
+    if shape is None or dtype is None or ndim is None or nbytes is None:
+        shape, dtype, ndim, nbytes = _describe_value(value)
+
+    if nbytes > size_limit:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Response would be {nbytes} bytes, exceeds "
+                f"DIRECT_CONTROL_RESPONSE_BYTESIZE_LIMIT ({size_limit}). "
+                "Slice the value or raise the limit."
+            ),
+        )
+
+    media = _negotiate_format(request, format_param)
+
+    if media == _BINARY_MEDIA:
+        # Reconstruct a contiguous numpy array. If `value` is already an
+        # ndarray we use it directly; if it was converted to a list upstream
+        # (monitored endpoint path) we rebuild via dtype.
+        if isinstance(value, np.ndarray):
+            arr = value
+        elif dtype:
+            try:
+                arr = np.asarray(value, dtype=np.dtype(dtype))
+            except (TypeError, ValueError) as e:
+                raise HTTPException(
+                    status_code=406,
+                    detail=f"Cannot serve as binary ({e}); request application/json.",
+                )
+        else:
+            raise HTTPException(
+                status_code=406,
+                detail=(
+                    "Value is not a numeric array/scalar with known dtype; "
+                    "cannot serve as binary. Request application/json."
+                ),
+            )
+        if arr.dtype.kind not in "iufbc":
+            raise HTTPException(
+                status_code=406,
+                detail=(
+                    f"dtype {arr.dtype} is not numeric; "
+                    "cannot serve as binary. Request application/json."
+                ),
+            )
+        body = np.ascontiguousarray(arr).tobytes()
+        headers = {
+            "X-PV-Name": pv_name,
+            "X-PV-Shape": ",".join(str(s) for s in shape),
+            "X-PV-Dtype": dtype or "",
+            "X-PV-Ndim": str(ndim),
+            "X-PV-Nbytes": str(nbytes),
+            "X-PV-Timestamp": timestamp_iso,
+        }
+        return Response(body, media_type=_BINARY_MEDIA, headers=headers)
+
+    payload: Dict[str, Any] = {
+        "pv_name": pv_name,
+        "value": _coerce_json_value(value),
+        "timestamp": timestamp_iso,
+        "shape": shape,
+        "dtype": dtype,
+        "ndim": ndim,
+        "nbytes": nbytes,
+    }
+    if extra:
+        payload.update(extra)
+    return JSONResponse(payload)
+
+
 @app.get("/health", response_model=HealthResponse)
 async def health_check(
     coordination_client: CoordinationService = Depends(get_coordination_client),
@@ -244,6 +394,11 @@ async def set_pv(
 @app.get("/api/v1/pv/{pv_name}/value")
 async def get_pv_value_from_controller(
     pv_name: str,
+    request: Request,
+    format: Optional[str] = Query(
+        None,
+        description="Override Accept header. 'json' or 'binary' (octet-stream).",
+    ),
     as_string: bool = Query(False, description="Return the string representation (e.g. enum label)"),
     count: Optional[int] = Query(None, ge=1, description="Max waveform elements to return"),
     as_numpy: bool = Query(True, description="Return arrays as numpy.ndarray (JSON-serialized to list)"),
@@ -261,12 +416,16 @@ async def get_pv_value_from_controller(
     ftype: Optional[int] = Query(None, description="Force non-native DBR type (power user)"),
     device_controller: DeviceControl = Depends(get_device_controller),
     registry_client: RegistryClient = Depends(get_registry_client),
+    settings: Settings = Depends(get_settings),
 ):
     """
     One-shot CA get via DeviceController (no subscription).
 
-    Exposes the pyepics caget / ca.get knobs as query params; defaults
-    preserve the previous behavior.
+    Exposes the pyepics caget / ca.get knobs as query params. Returns a
+    tiled-style envelope: JSON by default with `shape`/`dtype`/`ndim`/
+    `nbytes` alongside the value; `Accept: application/octet-stream` (or
+    `?format=binary`) returns raw bytes with the same metadata in
+    `X-PV-*` headers.
     """
     try:
         await registry_client.validate_pv(pv_name)
@@ -288,29 +447,34 @@ async def get_pv_value_from_controller(
     if value is None:
         raise HTTPException(status_code=404, detail=f"PV {pv_name} not found or not available")
 
-    # pyepics returns numpy.ndarray for waveforms when as_numpy=True; FastAPI's
-    # default JSON encoder doesn't handle that, so coerce to a plain list.
-    if hasattr(value, "tolist"):
-        value = value.tolist()
-
-    return {
-        "pv_name": pv_name,
-        "value": value,
-        "timestamp": datetime.now().isoformat(),
-    }
+    return _build_value_response(
+        request,
+        pv_name=pv_name,
+        value=value,
+        timestamp_iso=datetime.now().isoformat(),
+        size_limit=settings.response_bytesize_limit,
+        format_param=format,
+    )
 
 
-@app.get("/api/v1/pvs/{pv_name}/value", response_model=PVValue)
+@app.get("/api/v1/pvs/{pv_name}/value")
 async def get_monitored_pv_value(
     pv_name: str,
+    request: Request,
+    format: Optional[str] = Query(
+        None,
+        description="Override Accept header. 'json' or 'binary' (octet-stream).",
+    ),
     pv_monitor: PVMonitor = Depends(get_pv_monitor),
     registry_client: RegistryClient = Depends(get_registry_client),
+    settings: Settings = Depends(get_settings),
 ):
     """
     Get current value of a PV from the monitoring subscription cache.
 
-    Subscribes to the PV if not already subscribed. Returns full metadata
-    (units, precision, limits, access flags).
+    Subscribes to the PV if not already subscribed. Returns the same
+    tiled-style envelope as the one-shot endpoint plus the monitor's
+    full metadata (connected, alarm, limits, units, access flags).
     """
     try:
         await registry_client.validate_pv(pv_name)
@@ -324,10 +488,9 @@ async def get_monitored_pv_value(
         # avoids a TOCTOU gap and reads block briefly on EPICS, so run off-loop.
         await asyncio.to_thread(pv_monitor.subscribe, pv_name)
 
-        value = await asyncio.to_thread(pv_monitor.get_value, pv_name)
-        if not value:
+        pv_value = await asyncio.to_thread(pv_monitor.get_value, pv_name)
+        if not pv_value:
             raise HTTPException(status_code=404, detail=f"PV {pv_name} not found")
-        return value
     except HTTPException:
         raise
     except PVNotFoundError as e:
@@ -336,6 +499,34 @@ async def get_monitored_pv_value(
     except Exception as e:
         logger.error("get_monitored_pv_error", pv_name=pv_name, error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
+
+    extra = {
+        "status": pv_value.status,
+        "severity": pv_value.severity,
+        "connected": pv_value.connected,
+        "units": pv_value.units,
+        "precision": pv_value.precision,
+        "enum_strs": pv_value.enum_strs,
+        "lower_ctrl_limit": pv_value.lower_ctrl_limit,
+        "upper_ctrl_limit": pv_value.upper_ctrl_limit,
+        "lower_disp_limit": pv_value.lower_disp_limit,
+        "upper_disp_limit": pv_value.upper_disp_limit,
+        "read_access": pv_value.read_access,
+        "write_access": pv_value.write_access,
+    }
+    return _build_value_response(
+        request,
+        pv_name=pv_name,
+        value=pv_value.value,
+        timestamp_iso=pv_value.timestamp.isoformat(),
+        size_limit=settings.response_bytesize_limit,
+        format_param=format,
+        shape=pv_value.shape,
+        dtype=pv_value.dtype,
+        ndim=pv_value.ndim,
+        nbytes=pv_value.nbytes,
+        extra=extra,
+    )
 
 
 @app.get("/api/v1/pvs/connected", response_model=list[str])

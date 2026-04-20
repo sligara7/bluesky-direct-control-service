@@ -151,7 +151,10 @@ class PVValue(BaseModel):
     Current value of a PV (as-ophyd-api compatible).
 
     Returned by PVMonitor.get_value(). Includes EPICS metadata for richer
-    client display (units, precision, limits, alarm status).
+    client display (units, precision, limits, alarm status) plus array shape
+    metadata derived from the raw numpy return before conversion. `value`
+    itself is JSON-friendly (scalars and nested lists); clients that want
+    raw binary use the endpoint's `Accept: application/octet-stream` mode.
     """
     model_config = ConfigDict(extra="allow")
 
@@ -161,6 +164,12 @@ class PVValue(BaseModel):
     status: int = 0
     severity: int = 0
     connected: bool = True
+
+    # Array structure captured pre-conversion (all zero/None for scalars).
+    shape: List[int] = Field(default_factory=list)
+    dtype: Optional[str] = None
+    ndim: int = 0
+    nbytes: int = 0
 
     units: Optional[str] = None
     precision: Optional[int] = None
