@@ -15,11 +15,13 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import httpx
+import numpy as np
 import structlog
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from ._array_metadata import describe_array
 from .config import Settings
 from .coordination_client import CoordinationClient
 from .device_controller import DeviceController
@@ -165,30 +167,12 @@ _FORMAT_ALIASES = {
 }
 
 
-def _describe_value(value: Any) -> tuple:
-    """Return (shape, dtype_str, ndim, nbytes) for a pyepics/JSON value."""
-    import numpy as np
-
-    if value is None:
-        return [], None, 0, 0
-    if isinstance(value, np.ndarray):
-        return list(value.shape), value.dtype.str, int(value.ndim), int(value.nbytes)
-    if isinstance(value, (np.number, np.bool_)):
-        arr = np.asarray(value)
-        return [], arr.dtype.str, 0, int(arr.nbytes)
-    return [], None, 0, 0
-
-
-def _coerce_json_value(value: Any) -> Any:
-    """numpy arrays/scalars -> JSON-native; leave everything else untouched."""
-    if value is None:
-        return None
-    tolist = getattr(value, "tolist", None)
-    return tolist() if callable(tolist) else value
-
-
 def _negotiate_format(request: Request, format_param: Optional[str]) -> str:
-    """Pick a supported media type from ?format= or the Accept header."""
+    """Pick a supported media type from ?format= or the Accept header.
+
+    Returns 406 if Accept lists only media types we don't serve, matching
+    tiled's contract rather than silently defaulting to JSON.
+    """
     if format_param:
         resolved = _FORMAT_ALIASES.get(format_param.lower(), format_param)
         if resolved not in (_JSON_MEDIA, _BINARY_MEDIA):
@@ -198,14 +182,22 @@ def _negotiate_format(request: Request, format_param: Optional[str]) -> str:
             )
         return resolved
 
-    accept = request.headers.get("accept", _JSON_MEDIA)
+    accept = request.headers.get("accept")
+    if not accept:
+        return _JSON_MEDIA
     for chunk in accept.split(","):
         media = chunk.split(";")[0].strip()
         if media == "*/*":
             return _JSON_MEDIA
         if media in (_JSON_MEDIA, _BINARY_MEDIA):
             return media
-    return _JSON_MEDIA
+    raise HTTPException(
+        status_code=406,
+        detail=(
+            f"No supported media types in Accept: {accept}. "
+            f"Supported: {_JSON_MEDIA}, {_BINARY_MEDIA}."
+        ),
+    )
 
 
 def _build_value_response(
@@ -231,10 +223,8 @@ def _build_value_response(
     Binary mode returns raw bytes; shape/dtype live in `X-PV-*` headers so
     clients can reshape.
     """
-    import numpy as np
-
     if shape is None or dtype is None or ndim is None or nbytes is None:
-        shape, dtype, ndim, nbytes = _describe_value(value)
+        shape, dtype, ndim, nbytes = describe_array(value)
 
     if nbytes > size_limit:
         raise HTTPException(
@@ -289,9 +279,10 @@ def _build_value_response(
         }
         return Response(body, media_type=_BINARY_MEDIA, headers=headers)
 
+    tolist = getattr(value, "tolist", None)
     payload: Dict[str, Any] = {
         "pv_name": pv_name,
-        "value": _coerce_json_value(value),
+        "value": tolist() if callable(tolist) else value,
         "timestamp": timestamp_iso,
         "shape": shape,
         "dtype": dtype,
@@ -500,20 +491,12 @@ async def get_monitored_pv_value(
         logger.error("get_monitored_pv_error", pv_name=pv_name, error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
-    extra = {
-        "status": pv_value.status,
-        "severity": pv_value.severity,
-        "connected": pv_value.connected,
-        "units": pv_value.units,
-        "precision": pv_value.precision,
-        "enum_strs": pv_value.enum_strs,
-        "lower_ctrl_limit": pv_value.lower_ctrl_limit,
-        "upper_ctrl_limit": pv_value.upper_ctrl_limit,
-        "lower_disp_limit": pv_value.lower_disp_limit,
-        "upper_disp_limit": pv_value.upper_disp_limit,
-        "read_access": pv_value.read_access,
-        "write_access": pv_value.write_access,
-    }
+    # Everything in PVValue that isn't already in the envelope auto-propagates;
+    # new metadata fields on PVValue will appear here without edits.
+    extra = pv_value.model_dump(
+        exclude={"pv_name", "value", "timestamp", "shape", "dtype", "ndim", "nbytes"},
+        mode="json",
+    )
     return _build_value_response(
         request,
         pv_name=pv_name,
