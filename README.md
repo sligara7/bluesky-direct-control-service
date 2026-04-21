@@ -372,6 +372,22 @@ Request → Registry validate → Coordination check → EPICS write
 If the coordination service is unreachable: `503 Service Unavailable`.
 If the PV/device is not registered in configuration_service: `404 Not Found`.
 
+## Running Tests
+
+```bash
+pip install -e ".[dev]"
+pytest
+```
+
+Tests live under `tests/`. The `test_ioc` session fixture (see
+`tests/conftest.py`) spawns a caproto-backed soft-IOC in a subprocess on
+port 5064 for the duration of the test session; if port 5064 is already
+in use, the fixture assumes an IOC is already running and reuses it.
+`tests/test_ioc.py` defines the PV set (`IOC:m1`, `IOC:counter`, `IOC:wf1`,
+`IOC:shutter`). Coordination and registry validation are stubbed out in
+`conftest.py` so tests don't require the real experiment_execution or
+configuration services.
+
 ## Architecture
 
 ```
