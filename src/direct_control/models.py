@@ -207,6 +207,19 @@ class PVUpdate(BaseModel):
     units: Optional[str] = None
     precision: Optional[int] = None
 
+    @classmethod
+    def from_value(cls, pv_value: "PVValue", **overrides: Any) -> "PVUpdate":
+        """Build a PVUpdate carrying the core fields of a PVValue (plus overrides)."""
+        return cls(
+            pv_name=pv_value.pv_name,
+            value=pv_value.value,
+            timestamp=pv_value.timestamp,
+            status=pv_value.status,
+            severity=pv_value.severity,
+            connected=pv_value.connected,
+            **overrides,
+        )
+
 
 class PVInfo(BaseModel):
     """Detailed PV information including metadata."""

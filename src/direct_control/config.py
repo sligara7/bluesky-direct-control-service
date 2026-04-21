@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     ws_heartbeat_interval: int = 30
     ws_message_queue_size: int = 1000
 
+    # Max PV (pv-socket) or device (device-socket) subscriptions per WS client.
+    # Protects the service and upstream IOCs from runaway subscribe storms.
+    max_subscriptions_per_client: int = 1000
+
     # PV buffering
     pv_buffer_size: int = 100
     pv_update_rate_limit: float = 0.1

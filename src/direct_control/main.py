@@ -66,6 +66,7 @@ async def lifespan(app: FastAPI):
     ws_manager = WebSocketManager(
         pv_monitor=pv_monitor,
         device_controller=device_controller,
+        settings=settings,
         registry_client=registry_client,
     )
     device_ws_manager = DeviceWebSocketManager(
@@ -225,6 +226,7 @@ def _build_value_response(
     """
     if shape is None or dtype is None or ndim is None or nbytes is None:
         shape, dtype, ndim, nbytes = describe_array(value)
+    assert shape is not None and ndim is not None and nbytes is not None
 
     if nbytes > size_limit:
         raise HTTPException(

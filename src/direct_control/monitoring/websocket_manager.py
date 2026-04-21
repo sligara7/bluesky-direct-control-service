@@ -13,6 +13,7 @@ from typing import Callable, Dict, Optional, Set, TYPE_CHECKING
 import structlog
 from fastapi import WebSocket, WebSocketDisconnect
 
+from ..config import Settings
 from ..models import (
     DeviceCommandRequest,
     DeviceLockedError,
@@ -21,7 +22,7 @@ from ..models import (
     WebSocketAction,
 )
 from ..registry_client import RegistryClient, RegistryValidationError
-from ._envelopes import send_error, send_event
+from ._envelopes import LockedWS, heartbeat_loop, send_error, send_event
 
 if TYPE_CHECKING:
     from ..protocols import DeviceControl, PVMonitor
@@ -42,36 +43,47 @@ class WebSocketManager:
         self,
         pv_monitor: "PVMonitor",
         device_controller: "DeviceControl",
+        settings: Settings,
         registry_client: Optional[RegistryClient] = None,
     ):
         self.pv_monitor = pv_monitor
         self.device_controller = device_controller
+        self.settings = settings
         self.registry_client = registry_client
-        self._connections: Dict[str, WebSocket] = {}
+        self._connections: Dict[str, LockedWS] = {}
         self._subscriptions: Dict[str, Set[str]] = {}
         self._pv_clients: Dict[str, Set[str]] = {}
         self._pv_callbacks: Dict[str, Callable[[PVUpdate], None]] = {}
+        self._heartbeat_tasks: Dict[str, asyncio.Task] = {}
         self._lock = asyncio.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
-    async def connect(self, websocket: WebSocket) -> str:
+    async def connect(self, websocket: WebSocket) -> tuple[str, LockedWS]:
+        """Accept the WS, wrap it for serialized sends, and register the client."""
         await websocket.accept()
+        wrapped = LockedWS(websocket)
         client_id = str(uuid.uuid4())
 
         if self._loop is None:
             self._loop = asyncio.get_running_loop()
 
         async with self._lock:
-            self._connections[client_id] = websocket
+            self._connections[client_id] = wrapped
             self._subscriptions[client_id] = set()
+            if self.settings.ws_heartbeat_interval > 0:
+                self._heartbeat_tasks[client_id] = asyncio.create_task(
+                    heartbeat_loop(wrapped, self.settings.ws_heartbeat_interval)
+                )
 
         logger.info("websocket_connected", client_id=client_id)
-        return client_id
+        return client_id, wrapped
 
     async def disconnect(self, client_id: str):
+        to_teardown: list[tuple[str, Optional[Callable]]] = []
         async with self._lock:
             self._connections.pop(client_id, None)
             pv_names = self._subscriptions.pop(client_id, set())
+            heartbeat = self._heartbeat_tasks.pop(client_id, None)
 
             for pv_name in pv_names:
                 if pv_name in self._pv_clients:
@@ -79,7 +91,14 @@ class WebSocketManager:
                     if not self._pv_clients[pv_name]:
                         self._pv_clients.pop(pv_name)
                         callback = self._pv_callbacks.pop(pv_name, None)
-                        self.pv_monitor.unsubscribe(pv_name, callback)
+                        to_teardown.append((pv_name, callback))
+
+        if heartbeat and not heartbeat.done():
+            heartbeat.cancel()
+
+        # pv_monitor.unsubscribe does blocking CA teardown; run off-loop.
+        for pv_name, callback in to_teardown:
+            await asyncio.to_thread(self.pv_monitor.unsubscribe, pv_name, callback)
 
         logger.info("websocket_disconnected", client_id=client_id, pv_count=len(pv_names))
 
@@ -130,21 +149,12 @@ class WebSocketManager:
         for value in values:
             if isinstance(value, BaseException) or value is None:
                 continue
-            await self._send_to_client(
-                client_id,
-                PVUpdate(
-                    pv_name=value.pv_name,
-                    value=value.value,
-                    timestamp=value.timestamp,
-                    status=value.status,
-                    severity=value.severity,
-                    connected=value.connected,
-                ),
-            )
+            await self._send_to_client(client_id, PVUpdate.from_value(value))
 
         logger.info("client_subscribed", client_id=client_id, pv_count=len(pv_names))
 
     async def unsubscribe_pvs(self, client_id: str, pv_names: list[str]):
+        to_teardown: list[tuple[str, Optional[Callable]]] = []
         async with self._lock:
             if client_id not in self._subscriptions:
                 return
@@ -156,8 +166,11 @@ class WebSocketManager:
                     if not self._pv_clients[pv_name]:
                         self._pv_clients.pop(pv_name)
                         callback = self._pv_callbacks.pop(pv_name, None)
-                        self.pv_monitor.unsubscribe(pv_name, callback)
-                        logger.info("unsubscribed_from_pv", pv_name=pv_name)
+                        to_teardown.append((pv_name, callback))
+
+        for pv_name, callback in to_teardown:
+            await asyncio.to_thread(self.pv_monitor.unsubscribe, pv_name, callback)
+            logger.info("unsubscribed_from_pv", pv_name=pv_name)
 
         logger.info("client_unsubscribed", client_id=client_id, pv_count=len(pv_names))
 
@@ -199,32 +212,32 @@ class WebSocketManager:
             )
 
     async def handle_client(self, websocket: WebSocket):
-        client_id = await self.connect(websocket)
+        client_id, ws = await self.connect(websocket)
 
         try:
             while True:
-                data = await websocket.receive_json()
+                data = await ws.receive_json()
                 action = data.get("action") or data.get("type")
 
                 if action in ("subscribe", WebSocketAction.SUBSCRIBE.value):
-                    await self._handle_subscribe(client_id, websocket, data)
+                    await self._handle_subscribe(client_id, ws, data)
                 elif action in ("unsubscribe", WebSocketAction.UNSUBSCRIBE.value):
-                    await self._handle_unsubscribe(client_id, websocket, data)
+                    await self._handle_unsubscribe(client_id, ws, data)
                 elif action == WebSocketAction.SUBSCRIBE_SAFELY.value:
-                    await self._handle_subscribe_safely(client_id, websocket, data)
+                    await self._handle_subscribe_safely(client_id, ws, data)
                 elif action == WebSocketAction.SUBSCRIBE_READ_ONLY.value:
-                    await self._handle_subscribe_read_only(client_id, websocket, data)
+                    await self._handle_subscribe_read_only(client_id, ws, data)
                 elif action == WebSocketAction.REFRESH.value:
-                    await self._handle_refresh(client_id, websocket, data)
+                    await self._handle_refresh(client_id, ws, data)
                 elif action == WebSocketAction.SET.value:
-                    await self._handle_set(client_id, websocket, data)
+                    await self._handle_set(client_id, ws, data)
                 elif action in ("stop", WebSocketAction.STOP.value):
-                    await self._handle_stop(websocket, data)
+                    await self._handle_stop(ws, data)
                 elif action == "ping":
-                    await send_event(websocket, "pong")
+                    await send_event(ws, "pong")
                 else:
                     logger.warning("unknown_message_type", type=action, client_id=client_id)
-                    await send_error(websocket, f"Unknown action: {action}")
+                    await send_error(ws, f"Unknown action: {action}")
 
         except WebSocketDisconnect:
             logger.info("websocket_disconnect", client_id=client_id)
@@ -233,13 +246,39 @@ class WebSocketManager:
         finally:
             await self.disconnect(client_id)
 
+    async def _within_cap(
+        self, client_id: str, websocket: WebSocket, requested: int
+    ) -> bool:
+        """Reject with a WS error if subscribing `requested` more PVs would exceed the cap."""
+        cap = self.settings.max_subscriptions_per_client
+        if cap <= 0:
+            return True
+        async with self._lock:
+            current = len(self._subscriptions.get(client_id, set()))
+        if current + requested > cap:
+            await send_error(
+                websocket,
+                (
+                    f"Subscribe would exceed max_subscriptions_per_client "
+                    f"(cap={cap}, current={current}, requested={requested})."
+                ),
+                cap=cap,
+                current=current,
+                requested=requested,
+            )
+            return False
+        return True
+
     async def _handle_subscribe(self, client_id: str, websocket: WebSocket, data: dict):
         pv_names = [data["pv"]] if data.get("pv") else data.get("pv_names", [])
 
         valid_pvs = await self._validate_pvs(websocket, pv_names)
-        if valid_pvs:
-            await send_event(websocket, "subscribed", pv_names=valid_pvs)
-            await self.subscribe_pvs(client_id, valid_pvs)
+        if not valid_pvs:
+            return
+        if not await self._within_cap(client_id, websocket, len(valid_pvs)):
+            return
+        await send_event(websocket, "subscribed", pv_names=valid_pvs)
+        await self.subscribe_pvs(client_id, valid_pvs)
 
     async def _handle_unsubscribe(self, client_id: str, websocket: WebSocket, data: dict):
         pv_names = [data["pv"]] if data.get("pv") else data.get("pv_names", [])
@@ -254,6 +293,8 @@ class WebSocketManager:
             return
 
         if not await self._validate_single_pv(websocket, pv):
+            return
+        if not await self._within_cap(client_id, websocket, 1):
             return
 
         try:
@@ -277,9 +318,12 @@ class WebSocketManager:
         pv_names = [data["pv"]] if data.get("pv") else data.get("pv_names", [])
 
         valid_pvs = await self._validate_pvs(websocket, pv_names)
-        if valid_pvs:
-            await self.subscribe_pvs(client_id, valid_pvs)
-            await send_event(websocket, "subscribed", pv_names=valid_pvs, read_only=True)
+        if not valid_pvs:
+            return
+        if not await self._within_cap(client_id, websocket, len(valid_pvs)):
+            return
+        await self.subscribe_pvs(client_id, valid_pvs)
+        await send_event(websocket, "subscribed", pv_names=valid_pvs, read_only=True)
 
     async def _handle_refresh(self, client_id: str, websocket: WebSocket, data: dict):
         pv = data.get("pv")
@@ -299,16 +343,7 @@ class WebSocketManager:
                 continue
             await self._send_to_client(
                 client_id,
-                PVUpdate(
-                    pv_name=value.pv_name,
-                    value=value.value,
-                    timestamp=value.timestamp,
-                    status=value.status,
-                    severity=value.severity,
-                    connected=value.connected,
-                    read_access=True,
-                    write_access=True,
-                ),
+                PVUpdate.from_value(value, read_access=True, write_access=True),
             )
 
         await send_event(websocket, "refreshed", pv_names=pv_names)

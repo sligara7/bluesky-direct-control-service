@@ -23,7 +23,7 @@ from ..models import (
     PVUpdate,
     WebSocketAction,
 )
-from ._envelopes import send_error, send_event
+from ._envelopes import LockedWS, heartbeat_loop, send_error, send_event
 
 if TYPE_CHECKING:
     from ..protocols import DeviceControl, PVMonitor
@@ -50,11 +50,12 @@ class DeviceWebSocketManager:
         self.pv_monitor = pv_monitor
         self.device_controller = device_controller
         self.settings = settings
-        self._connections: Dict[str, WebSocket] = {}
+        self._connections: Dict[str, LockedWS] = {}
         self._device_subscriptions: Dict[str, Set[str]] = {}
         self._device_pvs: Dict[str, Dict[str, str]] = {}
         self._pv_callbacks: Dict[str, Callable[[PVUpdate], None]] = {}
         self._device_clients: Dict[str, Set[str]] = {}
+        self._heartbeat_tasks: Dict[str, asyncio.Task] = {}
         self._lock = asyncio.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._http_client: Optional[httpx.AsyncClient] = None
@@ -104,53 +105,79 @@ class DeviceWebSocketManager:
             logger.error("device_info_fetch_error", device_name=device_name, error=str(e))
             return None
 
-    async def connect(self, websocket: WebSocket) -> str:
+    async def connect(self, websocket: WebSocket) -> tuple[str, LockedWS]:
+        """Accept the WS, wrap it for serialized sends, and register the client."""
         await websocket.accept()
+        wrapped = LockedWS(websocket)
         client_id = str(uuid.uuid4())
 
         if self._loop is None:
             self._loop = asyncio.get_running_loop()
 
         async with self._lock:
-            self._connections[client_id] = websocket
+            self._connections[client_id] = wrapped
             self._device_subscriptions[client_id] = set()
+            if self.settings.ws_heartbeat_interval > 0:
+                self._heartbeat_tasks[client_id] = asyncio.create_task(
+                    heartbeat_loop(wrapped, self.settings.ws_heartbeat_interval)
+                )
 
         logger.info("device_websocket_connected", client_id=client_id)
-        return client_id
+        return client_id, wrapped
 
     async def disconnect(self, client_id: str):
         async with self._lock:
             self._connections.pop(client_id, None)
             device_names = self._device_subscriptions.pop(client_id, set())
+            heartbeat = self._heartbeat_tasks.pop(client_id, None)
             releases = []
             for device_name in device_names:
                 if device_name in self._device_clients:
                     self._device_clients[device_name].discard(client_id)
                     if not self._device_clients[device_name]:
                         self._device_clients.pop(device_name)
-                        releases.append(self._device_pvs.pop(device_name, {}))
+                        for pv_name in self._device_pvs.pop(device_name, {}).values():
+                            callback = self._pv_callbacks.pop(pv_name, None)
+                            if callback is not None:
+                                releases.append((pv_name, callback))
 
-        for pvs in releases:
-            for pv_name in pvs.values():
-                callback = self._pv_callbacks.pop(pv_name, None)
-                if callback:
-                    self.pv_monitor.unsubscribe(pv_name, callback)
+        if heartbeat and not heartbeat.done():
+            heartbeat.cancel()
+
+        # pv_monitor.unsubscribe does blocking CA teardown; run off-loop.
+        for pv_name, callback in releases:
+            await asyncio.to_thread(self.pv_monitor.unsubscribe, pv_name, callback)
 
         logger.info("device_websocket_disconnected", client_id=client_id)
 
     async def subscribe_device(
         self, client_id: str, device_name: str, require_connection: bool = False
-    ):
+    ) -> tuple[bool, Optional[str]]:
+        """
+        Returns (ok, reason). `reason` is one of None, 'unknown_client',
+        'cap_exceeded', 'not_found', 'not_connected' so callers can surface
+        an accurate WS error instead of collapsing everything into "not found".
+        """
+        cap = self.settings.max_subscriptions_per_client
         async with self._lock:
             if client_id not in self._connections:
                 logger.warning("subscribe_unknown_client", client_id=client_id)
-                return False
-            if device_name in self._device_subscriptions.get(client_id, set()):
-                return True
+                return False, "unknown_client"
+            current_subs = self._device_subscriptions.get(client_id, set())
+            if device_name in current_subs:
+                return True, None
+            if cap > 0 and len(current_subs) + 1 > cap:
+                logger.warning(
+                    "device_subscribe_cap_exceeded",
+                    client_id=client_id,
+                    cap=cap,
+                    current=len(current_subs),
+                )
+                return False, "cap_exceeded"
 
         device_info = await self._fetch_device_info(device_name)
         if device_info is None:
-            return False
+            return False, "not_found"
 
         new_subscriptions: list[tuple[str, str, Callable[[PVUpdate], None]]] = []
         async with self._lock:
@@ -181,7 +208,7 @@ class DeviceWebSocketManager:
                     "device_pv_subscribe_failed", pv=pv_name, error=str(result)
                 )
                 if require_connection:
-                    return False
+                    return False, "not_connected"
             else:
                 logger.debug(
                     "subscribed_device_pv",
@@ -198,7 +225,7 @@ class DeviceWebSocketManager:
             device=device_name,
             pvs=len(device_info.pvs),
         )
-        return True
+        return True, None
 
     async def unsubscribe_device(self, client_id: str, device_name: str):
         released_pvs: Dict[str, str] = {}
@@ -214,10 +241,13 @@ class DeviceWebSocketManager:
                     self._device_clients.pop(device_name)
                     released_pvs = self._device_pvs.pop(device_name, {})
 
+        teardowns: list[tuple[str, Callable[[PVUpdate], None]]] = []
         for pv_name in released_pvs.values():
             callback = self._pv_callbacks.pop(pv_name, None)
-            if callback:
-                self.pv_monitor.unsubscribe(pv_name, callback)
+            if callback is not None:
+                teardowns.append((pv_name, callback))
+        for pv_name, callback in teardowns:
+            await asyncio.to_thread(self.pv_monitor.unsubscribe, pv_name, callback)
 
         logger.info("device_unsubscribed", client_id=client_id, device=device_name)
 
@@ -291,32 +321,32 @@ class DeviceWebSocketManager:
                 logger.error("send_current_value_error", error=str(e))
 
     async def handle_client(self, websocket: WebSocket):
-        client_id = await self.connect(websocket)
+        client_id, ws = await self.connect(websocket)
 
         try:
             while True:
-                data = await websocket.receive_json()
+                data = await ws.receive_json()
                 action = data.get("action")
 
                 if action == "subscribe":
-                    await self._handle_subscribe(client_id, websocket, data)
+                    await self._handle_subscribe(client_id, ws, data)
                 elif action == "unsubscribe":
-                    await self._handle_unsubscribe(client_id, websocket, data)
+                    await self._handle_unsubscribe(client_id, ws, data)
                 elif action == WebSocketAction.SUBSCRIBE_SAFELY.value:
-                    await self._handle_subscribe_safely(client_id, websocket, data)
+                    await self._handle_subscribe_safely(client_id, ws, data)
                 elif action == WebSocketAction.SUBSCRIBE_READ_ONLY.value:
-                    await self._handle_subscribe_read_only(client_id, websocket, data)
+                    await self._handle_subscribe_read_only(client_id, ws, data)
                 elif action == WebSocketAction.REFRESH.value:
-                    await self._handle_refresh(client_id, websocket, data)
+                    await self._handle_refresh(client_id, ws, data)
                 elif action == WebSocketAction.SET.value:
-                    await self._handle_set(client_id, websocket, data)
+                    await self._handle_set(client_id, ws, data)
                 elif action in ("stop", WebSocketAction.STOP.value):
-                    await self._handle_stop(client_id, websocket, data)
+                    await self._handle_stop(client_id, ws, data)
                 elif action == "ping":
-                    await send_event(websocket, "pong")
+                    await send_event(ws, "pong")
                 else:
                     await send_error(
-                        websocket,
+                        ws,
                         (
                             f"Unknown action: {action}. Expected: subscribe, "
                             "unsubscribe, subscribeSafely, subscribeReadOnly, "
@@ -333,13 +363,30 @@ class DeviceWebSocketManager:
         finally:
             await self.disconnect(client_id)
 
+    async def _send_subscribe_error(
+        self, websocket, device_name: str, reason: Optional[str]
+    ) -> None:
+        """Map a subscribe_device failure reason to an actionable WS error."""
+        cap = self.settings.max_subscriptions_per_client
+        messages = {
+            "unknown_client": "Client not registered; reconnect and retry.",
+            "cap_exceeded": (
+                f"Subscribe would exceed max_subscriptions_per_client (cap={cap})."
+            ),
+            "not_found": f"Device '{device_name}' not found in configuration service",
+            "not_connected": f"Device {device_name} PVs are not connected",
+        }
+        message = messages.get(reason or "", f"Failed to subscribe to device {device_name}")
+        await send_error(websocket, message, device=device_name, reason=reason)
+
     async def _handle_subscribe(self, client_id: str, websocket: WebSocket, data: dict):
         device_name = data.get("device")
         if not device_name:
             await send_error(websocket, "device field required")
             return
 
-        if await self.subscribe_device(client_id, device_name):
+        ok, reason = await self.subscribe_device(client_id, device_name)
+        if ok:
             await send_event(
                 websocket,
                 "subscribed",
@@ -347,11 +394,7 @@ class DeviceWebSocketManager:
                 message=f"Subscribed to device {device_name}",
             )
         else:
-            await send_error(
-                websocket,
-                f"Device '{device_name}' not found in configuration service",
-                device=device_name,
-            )
+            await self._send_subscribe_error(websocket, device_name, reason)
 
     async def _handle_unsubscribe(self, client_id: str, websocket: WebSocket, data: dict):
         device_name = data.get("device")
@@ -373,17 +416,15 @@ class DeviceWebSocketManager:
             await send_error(websocket, "device field required")
             return
 
-        if await self.subscribe_device(client_id, device_name, require_connection=True):
+        ok, reason = await self.subscribe_device(
+            client_id, device_name, require_connection=True
+        )
+        if ok:
             await send_event(
                 websocket, "subscribed", device=device_name, connected=True
             )
         else:
-            await send_error(
-                websocket,
-                f"Device {device_name} not connected or not found",
-                device=device_name,
-                connected=False,
-            )
+            await self._send_subscribe_error(websocket, device_name, reason)
 
     async def _handle_subscribe_read_only(self, client_id: str, websocket: WebSocket, data: dict):
         device_name = data.get("device")
@@ -391,14 +432,13 @@ class DeviceWebSocketManager:
             await send_error(websocket, "device field required")
             return
 
-        if await self.subscribe_device(client_id, device_name):
+        ok, reason = await self.subscribe_device(client_id, device_name)
+        if ok:
             await send_event(
                 websocket, "subscribed", device=device_name, read_only=True
             )
         else:
-            await send_error(
-                websocket, f"Device {device_name} not found", device=device_name
-            )
+            await self._send_subscribe_error(websocket, device_name, reason)
 
     async def _handle_refresh(self, client_id: str, websocket: WebSocket, data: dict):
         device_name = data.get("device")

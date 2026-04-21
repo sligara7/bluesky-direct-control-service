@@ -156,12 +156,44 @@ class PVMonitorManager:
                 logger.error("callback_error", pv_name=pv_name, error=str(e))
 
     def _handle_meta_update(self, pv_name: str, **kwargs):
-        connected = kwargs.get("connected")
-        if connected is not None:
-            with self._lock:
-                self._connection_status[pv_name] = connected
-            if not connected:
-                logger.warning("pv_disconnected", pv_name=pv_name)
+        if "connected" not in kwargs:
+            return
+        connected = kwargs["connected"]
+
+        with self._lock:
+            previous = self._connection_status.get(pv_name)
+            if previous == connected:
+                return
+            # The first meta event after subscribe is ~always `connected=True`
+            # and duplicates the initial value the subscribe path already sent;
+            # skip that specific transition but still track the state.
+            first_and_connected = previous is None and connected
+            self._connection_status[pv_name] = connected
+            if first_and_connected:
+                return
+            callbacks = list(self._callbacks.get(pv_name, []))
+            latest = self._latest_values.get(pv_name)
+
+        if connected:
+            logger.info("pv_reconnected", pv_name=pv_name)
+        else:
+            logger.warning("pv_disconnected", pv_name=pv_name)
+
+        # Broadcast the connection state change so subscribers see it without
+        # waiting for the next value update (or forever, if there isn't one).
+        update = PVUpdate(
+            pv_name=pv_name,
+            value=latest.value if latest else None,
+            timestamp=datetime.now(),
+            status=0,
+            severity=0,
+            connected=connected,
+        )
+        for cb in callbacks:
+            try:
+                cb(update)
+            except Exception as e:
+                logger.error("meta_callback_error", pv_name=pv_name, error=str(e))
 
     def _convert_value(self, value):
         if isinstance(value, np.ndarray):
@@ -241,6 +273,7 @@ class PVMonitorManager:
     def unsubscribe(
         self, pv_name: str, callback: Optional[Callable] = None
     ) -> None:
+        signal_to_destroy = None
         with self._lock:
             if callback:
                 if pv_name in self._callbacks:
@@ -253,12 +286,19 @@ class PVMonitorManager:
 
             if not self._callbacks.get(pv_name) and pv_name in self._signals:
                 logger.info("disconnecting_pv", pv_name=pv_name)
-                signal = self._signals.pop(pv_name, None)
-                if signal:
-                    signal.clear_sub(None)
+                signal_to_destroy = self._signals.pop(pv_name, None)
                 self._connection_status.pop(pv_name, None)
                 self._buffers.pop(pv_name, None)
                 self._latest_values.pop(pv_name, None)
+
+        # destroy() does CA TCP teardown + drops pyepics _PVcache_ entry via
+        # ophyd finalizers; run outside self._lock so concurrent subscribers
+        # aren't blocked on network I/O.
+        if signal_to_destroy is not None:
+            try:
+                signal_to_destroy.destroy()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("pv_destroy_failed", pv_name=pv_name, error=str(e))
 
     def get_value(self, pv_name: str) -> Optional[PVValue]:
         with self._lock:
@@ -291,13 +331,15 @@ class PVMonitorManager:
     async def cleanup(self):
         logger.info("cleaning_up_pv_connections")
         with self._lock:
-            for signal in self._signals.values():
-                try:
-                    signal.clear_sub(None)
-                except Exception:
-                    pass
+            signals = list(self._signals.values())
             self._signals.clear()
             self._callbacks.clear()
             self._connection_status.clear()
             self._buffers.clear()
             self._latest_values.clear()
+
+        for signal in signals:
+            try:
+                signal.destroy()
+            except Exception:  # noqa: BLE001
+                pass

@@ -79,6 +79,7 @@ All settings use the `DIRECT_CONTROL_` environment variable prefix.
 | `DIRECT_CONTROL_PV_BUFFER_SIZE` | `100` | PV value buffer size |
 | `DIRECT_CONTROL_PV_UPDATE_RATE_LIMIT` | `0.1` | Min seconds between updates |
 | `DIRECT_CONTROL_RESPONSE_BYTESIZE_LIMIT` | `100000000` | Max bytesize for PV value responses (400 if exceeded) |
+| `DIRECT_CONTROL_MAX_SUBSCRIPTIONS_PER_CLIENT` | `1000` | Max PVs (pv-socket) or devices (device-socket) one WS client may subscribe to. 0 disables the cap. |
 | `DIRECT_CONTROL_ENABLE_METRICS` | `true` | Enable Prometheus metrics |
 | `DIRECT_CONTROL_METRICS_PORT` | `9003` | Metrics port |
 | `EPICS_CA_ADDR_LIST` | — | EPICS Channel Access address list |
@@ -314,8 +315,17 @@ curl -X POST http://localhost:8003/api/v1/device/motor.user_setpoint \
 {"type": "subscribed", "pv_names": ["IOC:m1"], "timestamp": "..."}
 {"type": "set_complete", "pv": "IOC:m1", "success": true, "value": 10}
 {"type": "error", "message": "Device locked by plan count", "locked": true}
+{"type": "heartbeat", "timestamp": "..."}
 {"event_type": "pv_update", "pv_name": "IOC:m1", "value": 10.5, "connected": true, ...}
+{"event_type": "pv_update", "pv_name": "IOC:m1", "value": null, "connected": false, ...}
 ```
+
+**Connection lifecycle events**
+
+- The server emits `{"type": "heartbeat"}` every `DIRECT_CONTROL_WS_HEARTBEAT_INTERVAL` seconds (default 30s). Primarily to keep NAT/proxy TCP connections warm and to surface dead peers early. No response required; clients can ignore it.
+- When a PV's CA connection goes down or comes back, subscribed clients receive a synthetic `pv_update` with the new `connected` flag. Value-updates stop while the PV is disconnected; the client gets a fresh value-update when the IOC reconnects.
+- When the last WS client unsubscribes from a PV, the service also disconnects the underlying pyepics PV object, freeing the IOC-side monitor. A subsequent subscribe re-pays the UDP search + TCP setup (~30ms).
+- Per-client subscription cap: `DIRECT_CONTROL_MAX_SUBSCRIPTIONS_PER_CLIENT` (default 1000). Attempts to exceed it return a WS error; the subscribe is rejected atomically (no partial subscribes).
 
 ### Device-Level Monitoring (`/api/v1/device-socket`)
 
