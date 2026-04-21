@@ -7,10 +7,15 @@ send that envelope so the two managers don't repeat it ~60 times.
 """
 
 import asyncio
+import json
 from datetime import datetime
 from typing import Any, Optional
 
 from fastapi import WebSocket
+
+
+class WebSocketResponseTooLarge(Exception):
+    """Raised when an outbound WS frame would exceed the configured size cap."""
 
 
 class LockedWS:
@@ -23,11 +28,17 @@ class LockedWS:
     triggered by CA callbacks, and the heartbeat task. Without
     serialization these can interleave at the ASGI layer and produce
     protocol errors on busy connections.
+
+    When ``max_message_bytes`` is set, outbound payloads are measured
+    against it and oversize frames raise ``WebSocketResponseTooLarge``
+    before anything goes on the wire. This is the WS-side parallel of
+    the ``DIRECT_CONTROL_RESPONSE_BYTESIZE_LIMIT`` HTTP cap.
     """
 
-    def __init__(self, ws: WebSocket):
+    def __init__(self, ws: WebSocket, *, max_message_bytes: Optional[int] = None):
         self._ws = ws
         self._send_lock = asyncio.Lock()
+        self._max_message_bytes = max_message_bytes
 
     async def accept(self) -> None:
         await self._ws.accept()
@@ -36,12 +47,28 @@ class LockedWS:
         await self._ws.close(code=code, reason=reason)
 
     async def send_json(self, data: Any) -> None:
+        # Pre-serialize so we can enforce the size cap before the frame
+        # reaches Starlette. Measuring after framing is too late.
+        text = json.dumps(data)
+        self._check_size(text)
         async with self._send_lock:
-            await self._ws.send_json(data)
+            await self._ws.send_text(text)
 
     async def send_text(self, data: str) -> None:
+        self._check_size(data)
         async with self._send_lock:
             await self._ws.send_text(data)
+
+    def _check_size(self, text: str) -> None:
+        if self._max_message_bytes is None:
+            return
+        size = len(text.encode("utf-8"))
+        if size > self._max_message_bytes:
+            raise WebSocketResponseTooLarge(
+                f"WS message size {size} bytes exceeds "
+                f"DIRECT_CONTROL_RESPONSE_BYTESIZE_LIMIT ({self._max_message_bytes}). "
+                "Slice the value or raise the limit."
+            )
 
     async def receive_json(self) -> Any:
         return await self._ws.receive_json()

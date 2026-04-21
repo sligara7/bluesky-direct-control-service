@@ -23,7 +23,7 @@ from ..models import (
     PVUpdate,
     WebSocketAction,
 )
-from ._envelopes import LockedWS, heartbeat_loop, send_error, send_event
+from ._envelopes import LockedWS, WebSocketResponseTooLarge, heartbeat_loop, send_error, send_event
 
 if TYPE_CHECKING:
     from ..protocols import DeviceControl, PVMonitor
@@ -108,7 +108,9 @@ class DeviceWebSocketManager:
     async def connect(self, websocket: WebSocket) -> tuple[str, LockedWS]:
         """Accept the WS, wrap it for serialized sends, and register the client."""
         await websocket.accept()
-        wrapped = LockedWS(websocket)
+        wrapped = LockedWS(
+            websocket, max_message_bytes=self.settings.response_bytesize_limit
+        )
         client_id = str(uuid.uuid4())
 
         if self._loop is None:
@@ -287,6 +289,23 @@ class DeviceWebSocketManager:
 
         try:
             await websocket.send_json(update.model_dump(mode="json"))
+        except WebSocketResponseTooLarge as e:
+            logger.warning(
+                "device_websocket_payload_too_large",
+                client_id=client_id,
+                device=update.device,
+                signal=update.signal,
+                error=str(e),
+            )
+            try:
+                await send_error(
+                    websocket,
+                    "payload exceeds size limit; update dropped",
+                    device=update.device,
+                    signal=update.signal,
+                )
+            except Exception:  # noqa: BLE001
+                pass
         except Exception as e:  # noqa: BLE001
             logger.error("device_websocket_send_error", client_id=client_id, error=str(e))
 
@@ -317,6 +336,22 @@ class DeviceWebSocketManager:
             )
             try:
                 await websocket.send_json(update.model_dump(mode="json"))
+            except WebSocketResponseTooLarge as e:
+                logger.warning(
+                    "send_current_value_too_large",
+                    device=device_name,
+                    signal=component,
+                    error=str(e),
+                )
+                try:
+                    await send_error(
+                        websocket,
+                        "payload exceeds size limit; current value dropped",
+                        device=device_name,
+                        signal=component,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
             except Exception as e:  # noqa: BLE001
                 logger.error("send_current_value_error", error=str(e))
 

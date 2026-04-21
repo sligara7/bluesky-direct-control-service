@@ -151,3 +151,47 @@ def test_oversize_response_rejected(client):
 
     # Restore so subsequent tests in the same session aren't affected.
     app.state.settings.response_bytesize_limit = Settings().response_bytesize_limit
+
+
+def test_ws_oversize_update_delivers_error_envelope(client):
+    """WS path enforces ``response_bytesize_limit``: oversize monitor updates
+    are dropped and the client receives a typed error envelope rather than a
+    silent drop or a dropped connection. Connection stays open for other PVs.
+    """
+    from direct_control.config import Settings
+
+    app = client.app
+    # Calibrated against current PVUpdate serialization: scalar updates are
+    # ~412 bytes (all the connected/read_access/timestamp fields inflate a
+    # 4-byte int), wf1 (20-element waveform) is ~517. 450 blocks wf1, passes
+    # counter, and leaves room for error envelopes (~130 bytes). Re-tune if
+    # the PVUpdate shape changes.
+    app.state.settings.response_bytesize_limit = 450
+
+    try:
+        with client.websocket_connect("/api/v1/pv-socket") as ws:
+            ws.send_json({"action": "subscribe", "pv": "IOC:wf1"})
+
+            deadline = time.monotonic() + 3.0
+            saw_error = False
+            while time.monotonic() < deadline:
+                msg = ws.receive_json()
+                if msg.get("type") == "error" and msg.get("pv_name") == "IOC:wf1":
+                    assert "size limit" in msg["message"].lower()
+                    saw_error = True
+                    break
+            assert saw_error, "never received error envelope for oversize update"
+
+            # Connection survives; a small-payload PV still flows.
+            ws.send_json({"action": "subscribe", "pv": "IOC:counter"})
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                msg = ws.receive_json()
+                if (
+                    msg.get("event_type") == "pv_update"
+                    and msg.get("pv_name") == "IOC:counter"
+                ):
+                    return
+            pytest.fail("connection should still deliver small-payload updates")
+    finally:
+        app.state.settings.response_bytesize_limit = Settings().response_bytesize_limit

@@ -22,7 +22,7 @@ from ..models import (
     WebSocketAction,
 )
 from ..registry_client import RegistryClient, RegistryValidationError
-from ._envelopes import LockedWS, heartbeat_loop, send_error, send_event
+from ._envelopes import LockedWS, WebSocketResponseTooLarge, heartbeat_loop, send_error, send_event
 
 if TYPE_CHECKING:
     from ..protocols import DeviceControl, PVMonitor
@@ -61,7 +61,9 @@ class WebSocketManager:
     async def connect(self, websocket: WebSocket) -> tuple[str, LockedWS]:
         """Accept the WS, wrap it for serialized sends, and register the client."""
         await websocket.accept()
-        wrapped = LockedWS(websocket)
+        wrapped = LockedWS(
+            websocket, max_message_bytes=self.settings.response_bytesize_limit
+        )
         client_id = str(uuid.uuid4())
 
         if self._loop is None:
@@ -203,6 +205,23 @@ class WebSocketManager:
 
         try:
             await websocket.send_json(update.model_dump(mode="json"))
+        except WebSocketResponseTooLarge as e:
+            logger.warning(
+                "websocket_payload_too_large",
+                client_id=client_id,
+                pv_name=update.pv_name,
+                error=str(e),
+            )
+            # Error envelope itself must fit under the cap; keep message short
+            # and hoist PV name into a structured field.
+            try:
+                await send_error(
+                    websocket,
+                    "payload exceeds size limit; update dropped",
+                    pv_name=update.pv_name,
+                )
+            except Exception:  # noqa: BLE001
+                pass
         except Exception as e:  # noqa: BLE001
             logger.error(
                 "websocket_send_error",

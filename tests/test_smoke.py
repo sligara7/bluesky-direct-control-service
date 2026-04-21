@@ -34,3 +34,35 @@ def test_stats_endpoint_returns_200(client):
 def test_unsupported_accept_returns_406(client):
     r = client.get("/api/v1/pv/IOC:m1/value", headers={"accept": "image/png"})
     assert r.status_code == 406
+
+
+# ===== LockedWS size cap (pure unit, no IOC) =====
+
+
+from unittest.mock import AsyncMock
+
+import pytest
+
+from direct_control.monitoring._envelopes import LockedWS, WebSocketResponseTooLarge
+
+
+async def test_locked_ws_passes_small_payload_when_cap_set():
+    fake_ws = AsyncMock()
+    locked = LockedWS(fake_ws, max_message_bytes=1024)
+    await locked.send_json({"type": "heartbeat", "ts": "2026"})
+    fake_ws.send_text.assert_awaited_once()
+
+
+async def test_locked_ws_raises_on_oversize_json():
+    fake_ws = AsyncMock()
+    locked = LockedWS(fake_ws, max_message_bytes=20)
+    with pytest.raises(WebSocketResponseTooLarge, match="exceeds"):
+        await locked.send_json({"value": "x" * 100})
+    fake_ws.send_text.assert_not_awaited()
+
+
+async def test_locked_ws_no_cap_allows_any_size():
+    fake_ws = AsyncMock()
+    locked = LockedWS(fake_ws)  # no max_message_bytes
+    await locked.send_json({"value": "x" * 10_000})
+    fake_ws.send_text.assert_awaited_once()
