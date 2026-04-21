@@ -161,11 +161,12 @@ def test_ws_oversize_update_delivers_error_envelope(client):
     from direct_control.config import Settings
 
     app = client.app
-    # Calibrated against current PVUpdate serialization: scalar updates are
-    # ~412 bytes (all the connected/read_access/timestamp fields inflate a
-    # 4-byte int), wf1 (20-element waveform) is ~517. 450 blocks wf1, passes
-    # counter, and leaves room for error envelopes (~130 bytes). Re-tune if
-    # the PVUpdate shape changes.
+    # Calibrated to sit between a scalar PVUpdate (~400 bytes — the
+    # timestamp/connected/read_access/write_access fields dominate a 4-byte
+    # value) and a 20-element waveform PVUpdate (~490 bytes). 450 blocks
+    # wf1, passes counter, and leaves headroom for the error envelope
+    # (~130 bytes). Re-tune if PVUpdate fields or the JSON serialization
+    # shape changes.
     app.state.settings.response_bytesize_limit = 450
 
     try:

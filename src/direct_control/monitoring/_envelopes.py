@@ -48,8 +48,10 @@ class LockedWS:
 
     async def send_json(self, data: Any) -> None:
         # Pre-serialize so we can enforce the size cap before the frame
-        # reaches Starlette. Measuring after framing is too late.
-        text = json.dumps(data)
+        # reaches Starlette. Measuring after framing is too late. Match
+        # Starlette's own serialization (compact separators, raw UTF-8)
+        # so we don't inflate wire size vs. the pre-cap behavior.
+        text = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
         self._check_size(text)
         async with self._send_lock:
             await self._ws.send_text(text)
@@ -60,13 +62,21 @@ class LockedWS:
             await self._ws.send_text(data)
 
     def _check_size(self, text: str) -> None:
-        if self._max_message_bytes is None:
+        limit = self._max_message_bytes
+        if limit is None:
+            return
+        # UTF-8 is at most 4 bytes per char, so if n*4 fits the cap the
+        # payload is guaranteed under it without materializing the bytes.
+        # This avoids a full-size bytes allocation per frame on the hot
+        # broadcast path; real payloads (mostly ASCII) always hit it.
+        n = len(text)
+        if n * 4 <= limit:
             return
         size = len(text.encode("utf-8"))
-        if size > self._max_message_bytes:
+        if size > limit:
             raise WebSocketResponseTooLarge(
                 f"WS message size {size} bytes exceeds "
-                f"DIRECT_CONTROL_RESPONSE_BYTESIZE_LIMIT ({self._max_message_bytes}). "
+                f"DIRECT_CONTROL_RESPONSE_BYTESIZE_LIMIT ({limit}). "
                 "Slice the value or raise the limit."
             )
 
